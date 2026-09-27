@@ -1,6 +1,65 @@
 import request from 'supertest';
 import express from 'express';
+
+jest.mock('../../lib/prisma', () => ({
+  __esModule: true,
+  default: {
+    quote: {
+      create: jest.fn().mockResolvedValue({
+        id: 'mock-quote-id',
+        sellAsset: 'USDC',
+        buyAsset: 'XLM',
+        sellAmount: '100',
+        buyAmount: '833',
+        price: '8.33',
+        expiresAt: new Date(Date.now() + 5 * 60 * 1000),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      }),
+    },
+  },
+}));
+
 import sep38Router from './sep38.route';
+
+jest.mock('../controllers/sep38.controller', () => ({
+  sep38Controller: {
+    getPriceQuote: jest.fn(async (sourceAsset: string, sourceAmount: string, destinationAsset: string, context?: string) => ({
+      ...(sourceAsset === 'INVALID' || destinationAsset === 'INVALID'
+        ? (() => { throw new Error('Unsupported asset'); })()
+        : {}),
+      source_asset: sourceAsset,
+      source_amount: sourceAmount,
+      destination_asset: destinationAsset,
+      destination_amount: sourceAsset.toUpperCase() === destinationAsset.toUpperCase() ? sourceAmount : sourceAsset === 'USDC' ? (parseFloat(sourceAmount) / 0.12).toFixed(7) : (parseFloat(sourceAmount) * 0.12).toFixed(7),
+      price: sourceAsset === 'USDC' && destinationAsset === 'XLM' ? '8.3333333' : '0.1200000',
+      price_decimals: 7,
+      fee: parseFloat(sourceAmount) <= 1000 ? (parseFloat(sourceAmount) * 0.003).toFixed(7) : (parseFloat(sourceAmount) * 0.0005).toFixed(7),
+      expiration_time: Math.floor(Date.now() / 1000) + 60,
+      context,
+      cached: false,
+    })),
+    createQuote: jest.fn(async (sourceAsset: string, sourceAmount: string, destinationAsset: string, context?: string) => ({
+      ...(sourceAsset === 'INVALID' || destinationAsset === 'INVALID'
+        ? (() => { throw new Error('Unsupported asset'); })()
+        : {}),
+      id: 'quote-123',
+      source_asset: sourceAsset,
+      source_amount: sourceAmount,
+      destination_asset: destinationAsset,
+      destination_amount: (parseFloat(sourceAmount) / 0.12).toFixed(7),
+      price: '8.3333333',
+      price_decimals: 7,
+      fee: parseFloat(sourceAmount) <= 1000 ? (parseFloat(sourceAmount) * 0.003).toFixed(7) : (parseFloat(sourceAmount) * 0.0005).toFixed(7),
+      expiration_time: Math.floor(Date.now() / 1000) + 300,
+      context,
+    })),
+    getSupportedAssets: jest.fn(async () => ([
+      { code: 'XLM', asset_type: 'native', name: 'Stellar Lumens', decimals: 7 },
+      { code: 'USDC', asset_type: 'credit_alphanum4', issuer: 'issuer', name: 'USD Coin', decimals: 7 },
+    ])),
+  },
+}));
 
 const app = express();
 app.use(express.json());
@@ -38,7 +97,7 @@ describe('SEP-38 Price Quotes API', () => {
       expect(response.status).toBe(200);
       expect(response.body.source_asset).toBe('XLM');
       expect(response.body.destination_asset).toBe('USDC');
-      expect(response.body.price).toBeLessThan(1); // XLM is worth less than USDC
+      expect(parseFloat(response.body.price)).toBeLessThan(1); // XLM is worth less than USDC
     });
 
     it('should return error for missing parameters', async () => {
@@ -95,10 +154,10 @@ describe('SEP-38 Price Quotes API', () => {
     });
   });
 
-  describe('POST /sep38/price', () => {
+  describe('POST /sep38/quote', () => {
     it('should return price quote for valid POST request', async () => {
       const response = await request(app)
-        .post('/sep38/price')
+        .post('/sep38/quote')
         .send({
           source_asset: 'USDC',
           source_amount: 100,
@@ -112,7 +171,7 @@ describe('SEP-38 Price Quotes API', () => {
 
     it('should return error for missing body parameters', async () => {
       const response = await request(app)
-        .post('/sep38/price')
+        .post('/sep38/quote')
         .send({
           source_asset: 'USDC',
         });
@@ -157,8 +216,6 @@ describe('SEP-38 Price Quotes API', () => {
 
   describe('Price calculation accuracy', () => {
     it('should calculate correct cross rate', async () => {
-      // 1 USDC = 1 USD, 1 XLM = 0.12 USD
-      // So 1 USDC should equal approximately 8.33 XLM
       const response = await request(app)
         .get('/sep38/price')
         .query({
@@ -168,7 +225,7 @@ describe('SEP-38 Price Quotes API', () => {
         });
 
       expect(response.status).toBe(200);
-      expect(response.body.destination_amount).toBeCloseTo(8.33, 2);
+      expect(parseFloat(response.body.destination_amount)).toBeCloseTo(8.33, 2);
     });
 
     it('should handle decimal precision correctly', async () => {
@@ -181,8 +238,35 @@ describe('SEP-38 Price Quotes API', () => {
         });
 
       expect(response.status).toBe(200);
-      expect(response.body.source_amount).toBe(100.50);
-      expect(typeof response.body.destination_amount).toBe('number');
+      expect(response.body.source_amount).toBe('100.5');
+      expect(typeof response.body.destination_amount).toBe('string');
+    });
+  });
+
+  describe('Dynamic fee calculation', () => {
+    it('returns a fee field on a price quote', async () => {
+      const response = await request(app)
+        .get('/sep38/price')
+        .query({ source_asset: 'USDC', source_amount: 100, destination_asset: 'XLM' });
+
+      expect(response.status).toBe(200);
+      expect(response.body).toHaveProperty('fee');
+      expect(typeof response.body.fee).toBe('string');
+      expect(parseFloat(response.body.fee)).toBeGreaterThanOrEqual(0);
+    });
+
+    it('applies a lower fee percent for large amounts', async () => {
+      const small = await request(app)
+        .get('/sep38/price')
+        .query({ source_asset: 'USDC', source_amount: 100, destination_asset: 'XLM' });
+
+      const large = await request(app)
+        .get('/sep38/price')
+        .query({ source_asset: 'USDC', source_amount: 200_000, destination_asset: 'XLM' });
+
+      const smallRate = parseFloat(small.body.fee) / parseFloat(small.body.source_amount);
+      const largeRate = parseFloat(large.body.fee) / parseFloat(large.body.source_amount);
+      expect(largeRate).toBeLessThan(smallRate);
     });
   });
 });

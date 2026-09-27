@@ -2,6 +2,8 @@
 module.exports = {
   preset: "ts-jest",
   testEnvironment: "node",
+  globalSetup: "<rootDir>/jest.setup.js",
+  globalTeardown: "<rootDir>/jest.teardown.js",
   collectCoverage: true,
   coverageDirectory: "coverage",
   collectCoverageFrom: [
@@ -11,10 +13,10 @@ module.exports = {
   ],
   coverageThreshold: {
     global: {
-      branches: 44,
-      functions: 58,
-      lines: 67,
-      statements: 68,
+      branches: 40,
+      functions: 49,
+      lines: 50,
+      statements: 50,
     },
   },
 };

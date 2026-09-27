@@ -3,7 +3,7 @@
 //! Provides a unified shape for all events emitted by AnchorPoint contracts,
 //! making it easier for off-chain indexers to process Soroban data.
 
-use soroban_sdk::{contracttype, symbol_short, Address, Env, Bytes};
+use soroban_sdk::{contracttype, symbol_short, Address, Bytes, Env};
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -102,6 +102,7 @@ pub trait EventEmitter {
 /// The payload is the structured `AnchorEvent` enum.
 /// The top-level topic is always `symbol_short!("anchor")` followed by the variant name,
 /// which allows indexers to filter globally for all AnchorPoint events.
+#[allow(deprecated)]
 pub fn emit_event(env: &Env, event: AnchorEvent) {
     let sub_topic = match &event {
         AnchorEvent::Deposit(_) => symbol_short!("deposit"),
@@ -111,7 +112,7 @@ pub fn emit_event(env: &Env, event: AnchorEvent) {
         AnchorEvent::Voted(_) => symbol_short!("voted"),
         AnchorEvent::ProposalExecuted(_) => symbol_short!("prop_exe"),
         AnchorEvent::FundsReleased(_) => symbol_short!("release"),
-        AnchorEvent::CrossContractEvent(_) => symbol_short!("x_contract"),
+        AnchorEvent::CrossContractEvent(_) => symbol_short!("xcontract"),
     };
 
     env.events()
@@ -122,7 +123,7 @@ pub fn emit_event(env: &Env, event: AnchorEvent) {
 mod tests {
     use super::*;
     use soroban_sdk::{
-        contract, contractimpl, testutils::Address as _, testutils::Events, vec, FromVal, IntoVal,
+        contract, contractimpl, testutils::Address as _, testutils::Events, vec, IntoVal,
     };
 
     #[contract]
@@ -151,26 +152,21 @@ mod tests {
 
         client.emit_test_event(&event);
 
-        let events = env.events().all();
-        assert_eq!(events.len(), 1);
-
-        let last_event = events.last().unwrap();
-        let expected_topics: soroban_sdk::Vec<Val> = vec![
-            &env,
-            symbol_short!("anchor").into_val(&env),
-            symbol_short!("deposit").into_val(&env),
-        ];
-
-        assert_eq!(last_event.1.len(), expected_topics.len());
-        for i in 0..expected_topics.len() {
-            assert_eq!(
-                last_event.1.get(i).unwrap().get_payload(),
-                expected_topics.get(i).unwrap().get_payload()
-            );
-        }
-
-        let published_event: AnchorEvent = AnchorEvent::from_val(&env, &last_event.2);
-        assert_eq!(published_event, event);
+        assert_eq!(
+            env.events().all(),
+            vec![
+                &env,
+                (
+                    id.clone(),
+                    vec![
+                        &env,
+                        symbol_short!("anchor").into_val(&env),
+                        symbol_short!("deposit").into_val(&env),
+                    ],
+                    event.clone().into_val(&env)
+                )
+            ]
+        );
     }
 
     #[test]
@@ -189,24 +185,20 @@ mod tests {
 
         client.emit_test_event(&event);
 
-        let events = env.events().all();
-        assert_eq!(events.len(), 1);
-
-        let last_event = events.last().unwrap();
-        let expected_topics: soroban_sdk::Vec<Val> = vec![
-            &env,
-            symbol_short!("anchor").into_val(&env),
-            symbol_short!("voted").into_val(&env),
-        ];
-
-        for i in 0..expected_topics.len() {
-            assert_eq!(
-                last_event.1.get(i).unwrap().get_payload(),
-                expected_topics.get(i).unwrap().get_payload()
-            );
-        }
-
-        let published_event: AnchorEvent = AnchorEvent::from_val(&env, &last_event.2);
-        assert_eq!(published_event, event);
+        assert_eq!(
+            env.events().all(),
+            vec![
+                &env,
+                (
+                    id.clone(),
+                    vec![
+                        &env,
+                        symbol_short!("anchor").into_val(&env),
+                        symbol_short!("voted").into_val(&env),
+                    ],
+                    event.clone().into_val(&env)
+                )
+            ]
+        );
     }
 }

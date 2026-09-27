@@ -60,7 +60,11 @@ jobs:
         run: npm ci
 
       - name: Install Playwright browser
-        run: npx playwright install --with-deps ${{ matrix.browser }}
+        run: npm exec --workspace dashboard -- playwright install --with-deps ${{ matrix.browser }}
 
-      - name: Run browser smoke test
+      - name: Run Playwright automated E2E browser tests
         run: npm run test:browser -w dashboard -- --project=${{ matrix.browser }}
+
+      - name: Cleanup test artifacts
+        if: always()
+        run: rm -rf dashboard/test-results

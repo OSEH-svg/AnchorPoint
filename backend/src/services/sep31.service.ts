@@ -36,6 +36,9 @@ export interface CreateTransactionInput {
   senderInfo: Record<string, string>;
   receiverInfo: Record<string, string>;
   callbackUrl?: string;
+  userPublicKey?: string;
+  /** Optional SEP-38 quote ID. When supplied the quote must exist and not be expired. */
+  quoteId?: string;
 }
 
 export interface Sep31Transaction {
@@ -55,6 +58,13 @@ export interface Sep31Transaction {
   refunded: boolean;
   startedAt: string;
   completedAt?: string;
+  // Additional status tracking fields
+  lastStatusUpdate?: string;
+  statusHistory?: Array<{
+    status: Sep31Status;
+    timestamp: string;
+    message?: string;
+  }>;
 }
 
 // ─── Callback Notifier Interface ──────────────────────────────────────────────
@@ -77,7 +87,7 @@ export class SEP31Service {
   async createTransaction(
     input: CreateTransactionInput,
   ): Promise<{ id: string; stellarAccountId: string }> {
-    const { assetCode, amount, senderInfo, receiverInfo, callbackUrl } = input;
+    const { assetCode, amount, senderInfo, receiverInfo, callbackUrl, userPublicKey, quoteId } = input;
 
     // 1. Validate asset
     if (!isSep31AssetSupported(assetCode)) {
@@ -120,18 +130,71 @@ export class SEP31Service {
       );
     }
 
-    // 5. Persist
+    // 5. Quote expiry validation — enforce strict time window to protect
+    //    against FX volatility losses.
+    let quotePrice: string | null = null;
+    if (quoteId) {
+      const quote = await prisma.quote.findUnique({ where: { id: quoteId } });
+
+      if (!quote) {
+        throw new Error(`quote_not_found: quote ${quoteId} does not exist`);
+      }
+
+      const now = new Date();
+      if (
+        quote.status === "EXPIRED" ||
+        (quote.expiresAt && now > quote.expiresAt)
+      ) {
+        throw new Error(
+          `quote_expired: quote ${quoteId} expired at ${quote.expiresAt?.toISOString() ?? "unknown"}`,
+        );
+      }
+
+      if (quote.status === "EXECUTED") {
+        throw new Error(`quote_already_used: quote ${quoteId} has already been executed`);
+      }
+
+      // Lock the rate by atomically claiming the quote. The conditional update
+      // guards against the quote expiring or being used concurrently between
+      // the read above and this write.
+      const claimed = await prisma.quote.updateMany({
+        where: {
+          id: quoteId,
+          status: "PENDING",
+          OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+        },
+        data: { status: "EXECUTED" },
+      });
+
+      if (claimed.count === 0) {
+        throw new Error(`quote_expired: quote ${quoteId} is no longer available`);
+      }
+
+      quotePrice = quote.price;
+    }
+
+    // 6. Calculate dynamic fee using FeeService
+    let feeAmount: string | null = null;
+    try {
+      const { FeeService } = require('./fee.service');
+      const feeService = new FeeService();
+      const feeResult = feeService.calculateAssetFee(assetCode, numericAmount);
+      feeAmount = feeResult.feeAmount.toFixed(7);
+    } catch {
+      // Fee calculation is non-critical; proceed without fee
+    }
+
+    // 7. Persist
     const id = randomUUID();
 
-    // We need a userId for the relation — use a system/placeholder user for SEP-31
-    // In a real system this would come from the authenticated JWT; for now we
-    // upsert a system user so the FK constraint is satisfied.
+    // We need a userId for the relation
+    const targetPublicKey = userPublicKey || "SEP31_SYSTEM";
     const systemUser = await prisma.user.upsert({
-      where: { publicKey: "SEP31_SYSTEM" },
+      where: { publicKey: targetPublicKey },
       update: {},
       create: {
-        publicKey: "SEP31_SYSTEM",
-        email: "sep31@system.internal",
+        publicKey: targetPublicKey,
+        email: targetPublicKey === "SEP31_SYSTEM" ? "sep31@system.internal" : `${targetPublicKey.toLowerCase()}@system.internal`,
       },
     });
 
@@ -141,18 +204,21 @@ export class SEP31Service {
         userId: systemUser.id,
         assetCode: assetCode.toUpperCase(),
         amount,
+        feeAmount,
         type: "SEP31",
         status: "pending_sender",
         sep31Status: "pending_sender",
         senderInfo: senderInfo as object,
         receiverInfo: receiverInfo as object,
         callbackUrl: callbackUrl ?? null,
+        quoteId: quoteId ?? null,
+        quotePrice,
       },
     });
 
     const stellarAccountId =
       process.env.STELLAR_ACCOUNT_ID ||
-      "GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZWM9CQJURIXI5JLHY2QB";
+      "GB7KUA47QKRI6Q6X7C3HOC2HEP6VJQRQWQYQF66VJPHJRVMEDJOVML6K";
 
     return { id, stellarAccountId };
   }
@@ -175,6 +241,11 @@ export class SEP31Service {
     id: string,
     status: Sep31Status,
     message?: string,
+    extraFields?: {
+      stellarTxId?: string;
+      externalId?: string;
+      feeAmount?: string;
+    },
   ): Promise<Sep31Transaction> {
     // Validate status
     if (!(VALID_SEP31_STATUSES as readonly string[]).includes(status)) {
@@ -201,6 +272,12 @@ export class SEP31Service {
 
     if (status === "error" && message) {
       updateData.requiredInfoMessage = message;
+    }
+
+    if (extraFields) {
+      if (extraFields.stellarTxId) updateData.stellarTxId = extraFields.stellarTxId;
+      if (extraFields.externalId) updateData.externalId = extraFields.externalId;
+      if (extraFields.feeAmount) updateData.feeAmount = extraFields.feeAmount;
     }
 
     const updated = await prisma.transaction.update({
@@ -256,8 +333,8 @@ export class SEP31Service {
       assetCode: record.assetCode,
       amount: record.amount,
       amountIn: record.amount,
-      amountOut: undefined,
-      amountFee: undefined,
+      amountOut: record.amount && record.feeAmount ? (parseFloat(record.amount) - parseFloat(record.feeAmount)).toFixed(2) : undefined,
+      amountFee: record.feeAmount ?? undefined,
       stellarTransactionId: record.stellarTxId ?? undefined,
       externalTransactionId: record.externalId ?? undefined,
       senderInfo: (record.senderInfo as Record<string, string>) ?? {},
@@ -275,6 +352,14 @@ export class SEP31Service {
           : record.completedAt
             ? String(record.completedAt)
             : undefined,
+      // Additional status tracking fields
+      lastStatusUpdate:
+        record.updatedAt instanceof Date
+          ? record.updatedAt.toISOString()
+          : record.updatedAt
+            ? String(record.updatedAt)
+            : undefined,
+      statusHistory: [],
     };
   }
 }

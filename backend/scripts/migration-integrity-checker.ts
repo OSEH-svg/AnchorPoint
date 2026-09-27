@@ -1,8 +1,8 @@
 #!/usr/bin/env ts-node
 
 import { execSync } from 'child_process';
-import * as fs from 'fs';
-import * as path from 'path';
+import fs from 'fs';
+import path from 'path';
 
 interface MigrationCheck {
   name: string;
@@ -375,7 +375,7 @@ class MigrationIntegrityChecker {
    * Check if there are any errors
    */
   private hasErrors(): boolean {
-    return !this.results.some(r => r.severity === 'error' && !r.passed);
+    return this.results.some(r => r.severity === 'error' && !r.passed);
   }
 
   /**

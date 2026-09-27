@@ -21,7 +21,8 @@ coverage/
 
 # Environment
 .env
-.env.*.local
+.env.*
+!.env.example
 *.local
 
 # Editor/System
@@ -37,5 +38,7 @@ coverage/
 *.sw?
 
 # Testing
+mutants.out/
+mutants.out.old/
 test_snapshots/
 **/test_snapshots/

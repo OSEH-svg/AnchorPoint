@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { getConfig, getUiConfig, getHistory, updateConfig, updateUiConfig, rollbackConfig } from '../controllers/config.controller';
+import { getConfig, getUiConfig, getHistory, updateConfig, updateUiConfig, rollbackConfig, getAuditLogs } from '../controllers/config.controller';
 
 const router = Router();
 
@@ -37,6 +37,48 @@ router.get('/ui', getUiConfig);
  *         description: Unauthorized
  */
 router.get('/history', getHistory);
+
+/**
+ * @swagger
+ * /config/audit-logs:
+ *   get:
+ *     summary: Get configuration audit logs
+ *     description: Retrieves the immutable admin audit trail for system configuration changes (updates, UI updates, and rollbacks).
+ *     tags: [Configuration]
+ *     security:
+ *       - ApiKeyAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: action
+ *         schema:
+ *           type: string
+ *           enum: [CONFIG_UPDATE, CONFIG_UI_UPDATE, CONFIG_ROLLBACK]
+ *         description: Filter by audit action
+ *       - in: query
+ *         name: actorId
+ *         schema:
+ *           type: string
+ *         description: Filter by the acting administrator id
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           minimum: 1
+ *           maximum: 200
+ *           default: 50
+ *       - in: query
+ *         name: offset
+ *         schema:
+ *           type: integer
+ *           minimum: 0
+ *           default: 0
+ *     responses:
+ *       200:
+ *         description: Audit logs retrieved
+ *       401:
+ *         description: Unauthorized
+ */
+router.get('/audit-logs', getAuditLogs);
 
 /**
  * @swagger

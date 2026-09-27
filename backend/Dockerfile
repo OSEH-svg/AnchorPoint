@@ -1,44 +1,60 @@
-# Stage 1: Build
+# =============================================================================
+# Stage 1: builder — installs ALL dependencies and compiles TypeScript
+# =============================================================================
 FROM node:20-alpine AS builder
 
 WORKDIR /app
 
-# Copy package files
-COPY package*.json ./
+# Copy dependency manifests first to maximise layer-cache reuse.
+# These layers are only invalidated when package*.json files change.
+COPY package.json package-lock.json ./
 
-# Install dependencies
-RUN npm ci
+# Install all dependencies including devDependencies needed for the build step.
+RUN npm ci --ignore-scripts
 
-# Copy source code
+# Copy application source after dependencies to keep the install layer cached.
 COPY . .
 
-# Build TypeScript
-RUN npm run build
+# Compile TypeScript → dist/ and generate Prisma client artefacts.
+RUN npm run build && npx prisma generate
 
-# Stage 2: Production
-FROM node:20-alpine AS production
+# Prune down to production-only node_modules in place so we can copy them
+# cleanly to the runtime stage. Clearing the npm cache shrinks this layer.
+RUN npm prune --omit=dev && npm cache clean --force
+
+# =============================================================================
+# Stage 2: runner — minimal production image with no build toolchain
+# =============================================================================
+FROM node:20-alpine AS runner
+
+# Runtime utilities:
+#   dumb-init  — proper PID-1 signal handling and zombie-process reaping
+#   wget       — lightweight health-check probe (no curl needed)
+RUN apk add --no-cache dumb-init wget
 
 WORKDIR /app
 
-# Copy package files
-COPY package*.json ./
+ENV NODE_ENV=production
 
-# Install production dependencies only
-RUN npm ci --only=production
+# Copy only the artefacts needed at runtime from the builder stage.
+# Nothing from the build toolchain (TypeScript compiler, devDependencies, etc.)
+# ever enters this image.
+COPY --from=builder /app/package*.json ./
+COPY --from=builder /app/node_modules  ./node_modules
+COPY --from=builder /app/dist          ./dist
+COPY --from=builder /app/prisma        ./prisma
+COPY --from=builder /app/tools         ./tools
+COPY --from=builder /app/docker-entrypoint.sh ./docker-entrypoint.sh
 
-# Copy built files from builder
-COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/prisma ./prisma
+# Run as the unprivileged 'node' user supplied by the official Node image.
+USER node
 
-# Generate Prisma client
-RUN npx prisma generate
-
-# Expose port
+# Backend API port
 EXPOSE 3002
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+# Orchestrator health-check (docker-compose, k8s liveness probe, etc.)
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
   CMD wget --no-verbose --tries=1 --spider http://localhost:3002/health || exit 1
 
-# Start the application
-CMD ["npm", "start"]
+ENTRYPOINT ["dumb-init", "--", "./docker-entrypoint.sh"]
+CMD ["node", "dist/index.js"]

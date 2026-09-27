@@ -1,4 +1,10 @@
-import { NotificationType, NotificationStatus } from "@prisma/client";
+import { NotificationStatus } from "@prisma/client";
+
+export enum NotificationType {
+  EMAIL = 'EMAIL',
+  SMS = 'SMS',
+  PUSH = 'PUSH'
+}
 import prisma from "../lib/prisma";
 import logger from "../utils/logger";
 
@@ -125,3 +131,8 @@ export class NotificationService {
 }
 
 export const notificationService = NotificationService.getInstance();
+
+export async function sendKycExpirationWarning(userId: string, renewalUrl: string): Promise<void> {
+  const message = `Your KYC verification expires soon. Please renew here: ${renewalUrl}`;
+  await notificationService.notify(userId, message);
+}

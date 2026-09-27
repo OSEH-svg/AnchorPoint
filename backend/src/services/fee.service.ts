@@ -2,6 +2,7 @@ import { RedisService } from './redis.service';
 import { getAsset, AssetConfig, FeeType } from '../config/assets';
 import logger from '../utils/logger';
 import { config } from '../config/env';
+import { DECIMAL_PRECISION, formatDecimal, toDecimal } from '../utils/decimal';
 
 const HORIZON_URL = config.HORIZON_URL;
 const CACHE_KEY = 'fee_engine:stats';
@@ -123,30 +124,32 @@ export interface AssetFeeResult {
  *  - percentage:  amount * feePercent, floored to feeMinimum.
  *  - tiered:      feeFixed + (amount * feePercent), floored to feeMinimum.
  */
-export function computeAssetFee(asset: AssetConfig, amount: number): number {
-  let fee: number;
+export function computeAssetFee(asset: AssetConfig, amount: number | string): number {
+  const amountValue = toDecimal(amount);
+  let fee = toDecimal(0);
+
   switch (asset.feeType) {
     case 'flat':
-      fee = asset.feeFixed;
+      fee = toDecimal(asset.feeFixed);
       break;
     case 'percentage':
-      fee = amount * asset.feePercent;
+      fee = amountValue.times(asset.feePercent);
       break;
     case 'tiered':
-      fee = asset.feeFixed + amount * asset.feePercent;
+      fee = toDecimal(asset.feeFixed).plus(amountValue.times(asset.feePercent));
       break;
     default:
       // Fallback: treat unknown feeType as tiered
-      fee = asset.feeFixed + amount * asset.feePercent;
+      fee = toDecimal(asset.feeFixed).plus(amountValue.times(asset.feePercent));
   }
 
   // Enforce the per-asset minimum fee
-  if (asset.feeMinimum > 0 && fee < asset.feeMinimum) {
-    fee = asset.feeMinimum;
+  if (asset.feeMinimum > 0 && fee.lt(asset.feeMinimum)) {
+    fee = toDecimal(asset.feeMinimum);
   }
 
   // Round to 7 decimal places to avoid floating-point dust
-  return parseFloat(fee.toFixed(7));
+  return Number(formatDecimal(fee, DECIMAL_PRECISION));
 }
 
 export class FeeService {
@@ -185,7 +188,7 @@ export class FeeService {
   }> {
     const stats = await this.getFeeStats();
     const estimatedFeeStroops = stats.recommendedFeeStroops * operationCount;
-    const estimatedFeeXLM = (estimatedFeeStroops / 1e7).toFixed(7);
+    const estimatedFeeXLM = formatDecimal(toDecimal(estimatedFeeStroops).dividedBy(1e7));
 
     return {
       estimatedFeeStroops,
@@ -202,7 +205,7 @@ export class FeeService {
    *
    * Throws if the asset code is unknown.
    */
-  calculateAssetFee(assetCode: string, amount: number): AssetFeeResult {
+  calculateAssetFee(assetCode: string, amount: number | string): AssetFeeResult {
     const asset = getAsset(assetCode);
     if (!asset) {
       throw new Error(`Unknown asset: ${assetCode}`);
@@ -213,11 +216,93 @@ export class FeeService {
     return {
       assetCode: asset.code,
       feeType: asset.feeType,
-      inputAmount: amount,
+      inputAmount: Number(formatDecimal(toDecimal(amount))),
       feeAmount,
       feeFixed: asset.feeFixed,
       feePercent: asset.feePercent,
       feeMinimum: asset.feeMinimum,
     };
   }
+
+  /**
+   * Calculates an itemized SEP-24 fee breakdown for a given asset, operation,
+   * and amount. Applies tiered percentage rules on top of any asset-level fixed
+   * fee:
+   *
+   *  - amount  < 1 000  → 1.00 % percentage tier
+   *  - amount >= 1 000  → 0.50 % percentage tier
+   *
+   * Returns individual line items (fixed_fee, percentage_fee) so wallets can
+   * display a transparent cost breakdown to the user.
+   */
+  calculateSep24Fee(
+    assetCode: string,
+    operation: 'deposit' | 'withdrawal',
+    amount: number | string,
+  ): Sep24FeeResult {
+    const asset = getAsset(assetCode);
+    if (!asset) {
+      throw new Error(`Unknown asset: ${assetCode}`);
+    }
+
+    const amountValue = Number(formatDecimal(toDecimal(amount)));
+
+    // Tiered percentage: 1 % below $1 000, 0.5 % at or above $1 000
+    const tierPercent = amountValue < 1_000 ? 0.01 : 0.005;
+
+    const fixedFee = Number(formatDecimal(toDecimal(asset.feeFixed)));
+    const percentageFee = Number(
+      formatDecimal(toDecimal(amountValue).times(tierPercent), DECIMAL_PRECISION),
+    );
+    const totalFee = Number(
+      formatDecimal(toDecimal(fixedFee).plus(percentageFee), DECIMAL_PRECISION),
+    );
+
+    const feeDetails: Sep24FeeDetail[] = [];
+
+    if (fixedFee > 0) {
+      feeDetails.push({
+        name: 'Flat fee',
+        amount: String(fixedFee),
+        description: `Flat processing fee for ${operation}`,
+      });
+    }
+
+    feeDetails.push({
+      name: 'Variable fee',
+      amount: String(percentageFee),
+      description: `${(tierPercent * 100).toFixed(2)}% fee (${amountValue < 1_000 ? 'standard tier' : 'reduced tier for amounts ≥ 1 000'})`,
+    });
+
+    return {
+      assetCode: asset.code,
+      operation,
+      inputAmount: amountValue,
+      totalFee,
+      feeFixed: fixedFee,
+      feePercent: tierPercent,
+      feeDetails,
+    };
+  }
+}
+
+// ─── SEP-24 itemized fee types ────────────────────────────────────────────────
+
+export interface Sep24FeeDetail {
+  /** Human-readable name of the fee component. */
+  name: string;
+  /** Fee amount as a string for precision. */
+  amount: string;
+  /** Optional explanation shown to the end user. */
+  description?: string;
+}
+
+export interface Sep24FeeResult {
+  assetCode: string;
+  operation: 'deposit' | 'withdrawal';
+  inputAmount: number;
+  totalFee: number;
+  feeFixed: number;
+  feePercent: number;
+  feeDetails: Sep24FeeDetail[];
 }

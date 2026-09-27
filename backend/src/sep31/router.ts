@@ -8,7 +8,8 @@ import {
   validateTransactionRequest,
   validateReceiverInfo,
 } from "./validation";
-import { Sep31TransactionRequest, Sep31ErrorResponse } from "./types";
+import { Sep31TransactionRequest, Sep31ErrorResponse, Sep31Config } from "./types";
+import { configService } from "../services/config.service";
 
 const router = Router();
 
@@ -25,13 +26,24 @@ function sep31Error(
   res.status(status).json(body);
 }
 
+/**
+ * Returns the current SEP-31 configuration from the dynamic SystemConfig.
+ * When the config service is unavailable or SEP-31 settings haven't been
+ * seeded yet, the underlying service and validation functions fall back to
+ * sensible hard-coded defaults.
+ */
+function getSep31Config(): Sep31Config {
+  return configService.getSep31Config() as unknown as Sep31Config;
+}
+
 // ─── GET /sep31/info ───────────────────────────────────────────────────────
 /**
  * Returns anchor capabilities and required fields for SEP-31 senders.
  * No authentication required.
+ * The asset list and fee values are sourced from the dynamic SystemConfig.
  */
 router.get("/info", (_req: Request, res: Response) => {
-  res.json(getSep31Info());
+  res.json(getSep31Info(getSep31Config()));
 });
 
 // ─── POST /sep31/transactions ──────────────────────────────────────────────
@@ -39,8 +51,11 @@ router.get("/info", (_req: Request, res: Response) => {
  * Initiates a new cross-border payment transaction.
  *
  * The sending anchor POSTs this with sender/receiver KYC identifiers and the
- * payment amount. The response contains the Stellar account and memo the
- * sender must use for the on-chain payment.
+ * payment amount. The response contains the Stellar account, memo, and a
+ * transparent fee breakdown.
+ *
+ * Amount limits and asset-support checks are validated against the dynamic
+ * SystemConfig.
  *
  * Requires a valid SEP-10 JWT (enforced by the auth middleware applied in
  * app.ts before mounting this router).
@@ -50,9 +65,10 @@ router.post(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const body = req.body as Partial<Sep31TransactionRequest>;
+      const sep31Config = getSep31Config();
 
-      // ── Field validation ───────────────────────────────────────────────
-      const { valid, errors } = validateTransactionRequest(body);
+      // ── Field validation (against SystemConfig-driven limits) ──────────
+      const { valid, errors } = validateTransactionRequest(body, sep31Config);
       if (!valid) {
         const firstError = errors[0];
         return sep31Error(
@@ -74,11 +90,28 @@ router.post(
         }
       }
 
-      // ── Create transaction ─────────────────────────────────────────────
-      const result = await createSep31Transaction(body as Sep31TransactionRequest);
+      // ── Create transaction with config-driven fees ─────────────────────
+      const result = await createSep31Transaction(
+        body as Sep31TransactionRequest,
+        sep31Config
+      );
 
       return res.status(201).json(result);
     } catch (err) {
+      if (err instanceof Error && /^quote_(not_found|expired|already_used)/.test(err.message)) {
+      // Surface receiver KYC and invalid memo errors as 400 responses
+      if (
+        err instanceof Error &&
+        (err as Error & { code?: string }).code === "receiver_kyc_required"
+      ) {
+        return sep31Error(res, 400, "receiver_kyc_required");
+      }
+      if (
+        err instanceof Error &&
+        (err as Error & { code?: string }).code === "invalid_field"
+      ) {
+        return sep31Error(res, 400, err.message);
+      }
       next(err);
     }
   }

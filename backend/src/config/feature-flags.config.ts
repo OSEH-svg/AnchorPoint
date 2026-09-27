@@ -214,6 +214,7 @@ export const DEFAULT_FEATURE_FLAGS: Record<string, FeatureFlag> = {
     description: 'Enable verbose logging (internal use only)',
     rolloutPercentage: 0,
     targetUsers: ['admin@anchorpoint.dev'],
+    whitelistedUserIds: ['debug-user-123'],
     createdAt: new Date(),
     updatedAt: new Date(),
   },

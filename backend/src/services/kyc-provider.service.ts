@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import CircuitBreaker from 'opossum';
 
 import { config } from '../config/env';
 
@@ -6,6 +7,7 @@ export enum KycStatus {
   PENDING = 'PENDING',
   ACCEPTED = 'ACCEPTED',
   REJECTED = 'REJECTED',
+  PENDING_PROVIDER_RETRY = 'PENDING_PROVIDER_RETRY',
 }
 
 export interface KycSubmissionInput {
@@ -43,8 +45,28 @@ export interface IKycProvider {
   parseWebhook(payload: unknown): KycWebhookResult | null;
 }
 
-const normalizeStatus = (rawStatus: string): KycStatus => {
+const getString = (
+  obj: Record<string, unknown> | undefined,
+  ...keys: string[]
+): string | undefined => {
+  if (!obj) return undefined;
+  for (const key of keys) {
+    const value = obj[key];
+    if (typeof value === 'string' && value.length > 0) return value;
+  }
+  return undefined;
+};
+
+const extractStatusToken = (rawStatus: string): string => {
   const value = rawStatus.toLowerCase();
+  if (value.includes('.')) {
+    return value.split('.').pop() ?? value;
+  }
+  return value.replace(/_/g, '-');
+};
+
+const normalizeStatus = (rawStatus: string): KycStatus => {
+  const value = extractStatusToken(rawStatus);
   if (['approved', 'accepted', 'completed', 'verified', 'clear'].includes(value)) {
     return KycStatus.ACCEPTED;
   }
@@ -55,6 +77,9 @@ const normalizeStatus = (rawStatus: string): KycStatus => {
 
   return KycStatus.PENDING;
 };
+
+const asRecord = (value: unknown): Record<string, unknown> | undefined =>
+  value && typeof value === 'object' ? (value as Record<string, unknown>) : undefined;
 
 const timingSafeMatch = (expected: string, actual: string): boolean => {
   const expectedBuffer = Buffer.from(expected);
@@ -67,7 +92,10 @@ const timingSafeMatch = (expected: string, actual: string): boolean => {
 class MockKycProvider implements IKycProvider {
   readonly providerName = 'mock';
 
-  async submitCustomer(data: KycSubmissionInput): Promise<KycSubmissionResult> {
+  async submitCustomer(
+    data: KycSubmissionInput,
+    _documents: Record<string, string> = {}
+  ): Promise<KycSubmissionResult> {
     if (data.email && data.email.includes('reject')) {
       return {
         success: true,
@@ -77,11 +105,20 @@ class MockKycProvider implements IKycProvider {
       };
     }
 
+    if (data.email && data.email.includes('pending')) {
+      return {
+        success: true,
+        providerRef: `mock_${Date.now()}`,
+        status: KycStatus.PENDING,
+        message: 'Customer submitted successfully. Pending review.',
+      };
+    }
+
     return {
       success: true,
       providerRef: `mock_${Date.now()}`,
-      status: KycStatus.PENDING,
-      message: 'Customer submitted successfully. Pending review.',
+      status: KycStatus.ACCEPTED,
+      message: 'Customer approved automatically.',
     };
   }
 
@@ -90,13 +127,19 @@ class MockKycProvider implements IKycProvider {
   }
 
   parseWebhook(payload: unknown): KycWebhookResult | null {
-    if (!payload || typeof payload !== 'object') return null;
-    const body = payload as Record<string, unknown>;
-    const account = typeof body.account === 'string' ? body.account : undefined;
-    const providerRef = typeof body.providerRef === 'string' ? body.providerRef : undefined;
-    const status = typeof body.status === 'string' ? normalizeStatus(body.status) : KycStatus.PENDING;
+    const body = asRecord(payload);
+    if (!body) return null;
 
-    return { account, providerRef, status };
+    const account = getString(body, 'account');
+    const providerRef = getString(body, 'providerRef');
+    if (!account && !providerRef) return null;
+
+    const status = getString(body, 'status');
+    return {
+      account,
+      providerRef,
+      status: status ? normalizeStatus(status) : KycStatus.PENDING,
+    };
   }
 }
 
@@ -163,22 +206,31 @@ class PersonaKycProvider implements IKycProvider {
   }
 
   parseWebhook(payload: unknown): KycWebhookResult | null {
-    if (!payload || typeof payload !== 'object') return null;
-    const body = payload as Record<string, unknown>;
-    const data = body.data as Record<string, unknown> | undefined;
-    const attributes = data?.attributes as Record<string, unknown> | undefined;
+    const body = asRecord(payload);
+    const data = asRecord(body?.data);
+    if (!data) return null;
 
-    if (!data || typeof data !== 'object') return null;
+    const attributes = asRecord(data.attributes);
+    const eventPayload = asRecord(attributes?.payload);
+    const inquiry = asRecord(eventPayload?.data);
+    const inquiryAttributes = asRecord(inquiry?.attributes);
 
-    const providerRef = typeof data.id === 'string' ? data.id : undefined;
+    const providerRef = getString(inquiry, 'id') ?? getString(data, 'id');
     const account =
-      typeof attributes?.referenceId === 'string' ? attributes.referenceId : undefined;
-    const status =
-      typeof attributes?.status === 'string'
-        ? normalizeStatus(attributes.status)
-        : KycStatus.PENDING;
+      getString(inquiryAttributes, 'reference-id', 'referenceId') ??
+      getString(attributes, 'reference-id', 'referenceId');
+    if (!providerRef && !account) return null;
 
-    return { providerRef, account, status };
+    const statusSource =
+      getString(inquiryAttributes, 'status') ??
+      getString(attributes, 'name') ??
+      getString(attributes, 'status');
+
+    return {
+      providerRef,
+      account,
+      status: statusSource ? normalizeStatus(statusSource) : KycStatus.PENDING,
+    };
   }
 }
 
@@ -253,36 +305,263 @@ class ShuftiKycProvider implements IKycProvider {
   }
 
   parseWebhook(payload: unknown): KycWebhookResult | null {
-    if (!payload || typeof payload !== 'object') return null;
-    const body = payload as Record<string, unknown>;
+    const body = asRecord(payload);
+    if (!body) return null;
 
-    const providerRef = typeof body.reference === 'string' ? body.reference : undefined;
-    const account = typeof body.reference === 'string' ? body.reference : undefined;
-    const statusSource =
-      typeof body.verification_status === 'string'
-        ? body.verification_status
-        : typeof body.event === 'string'
-          ? body.event
-          : 'pending';
+    const providerRef = getString(body, 'reference');
+    const account = providerRef;
+    if (!providerRef && !account) return null;
+
+    const statusSource = getString(body, 'verification_status', 'event');
 
     return {
       providerRef,
       account,
-      status: normalizeStatus(statusSource),
+      status: statusSource ? normalizeStatus(statusSource) : KycStatus.PENDING,
     };
   }
 }
 
+class CircuitBreakerKycProvider implements IKycProvider {
+  private provider: IKycProvider;
+  private breaker: CircuitBreaker<[KycSubmissionInput, Record<string, string>], KycSubmissionResult>;
+
+  constructor(provider: IKycProvider) {
+    this.provider = provider;
+
+    const options = {
+      errorThresholdPercentage: 100,
+      volumeThreshold: 5,
+      rollingCountTimeout: 30000,
+      resetTimeout: 30000,
+    };
+
+    this.breaker = new CircuitBreaker(
+      (data, documents) => this.provider.submitCustomer(data, documents),
+      options
+    );
+
+    this.breaker.fallback(() => ({
+      success: false,
+      status: KycStatus.PENDING_PROVIDER_RETRY,
+      message: 'KYC provider is currently unavailable. Will retry later.',
+    }));
+  }
+
+  get providerName(): string {
+    return this.provider.providerName;
+  }
+
+  submitCustomer(
+    data: KycSubmissionInput,
+    documents: Record<string, string>
+  ): Promise<KycSubmissionResult> {
+    return this.breaker.fire(data, documents);
+  }
+
+  verifyWebhookSignature(
+    payload: string,
+    signature: string | undefined,
+    headers?: Record<string, unknown>
+  ): boolean {
+    return this.provider.verifyWebhookSignature(payload, signature, headers);
+  }
+
+  parseWebhook(payload: unknown): KycWebhookResult | null {
+    return this.provider.parseWebhook(payload);
+  }
+}
+
 export const createKycProvider = (provider: string): IKycProvider => {
+  let baseProvider: IKycProvider;
   switch (provider) {
     case 'persona':
-      return new PersonaKycProvider();
+      baseProvider = new PersonaKycProvider();
+      break;
     case 'shufti':
-      return new ShuftiKycProvider();
+      baseProvider = new ShuftiKycProvider();
+      break;
     case 'mock':
     default:
-      return new MockKycProvider();
+      baseProvider = new MockKycProvider();
+      break;
   }
+  return new CircuitBreakerKycProvider(baseProvider);
 };
 
 export const kycProvider = createKycProvider(config.KYC_PROVIDER);
+
+export interface OutboundKycWebhookOptions {
+  url?: string;
+  maxRetries?: number;
+  baseDelayMs?: number;
+}
+
+export interface KycWebhookDeliveryLog {
+  attempt: number;
+  timestamp: string;
+  statusCode?: number;
+  error?: string;
+  success: boolean;
+}
+
+export class KycWebhookRetryEngine {
+  private readonly maxRetries: number;
+  private readonly baseDelayMs: number;
+  private readonly sleepFn: (ms: number) => Promise<void>;
+
+  constructor(
+    options: Partial<OutboundKycWebhookOptions> = {},
+    sleepFn: (ms: number) => Promise<void> = (ms) => new Promise((res) => setTimeout(res, ms))
+  ) {
+    this.maxRetries = options.maxRetries ?? 5;
+    this.baseDelayMs = options.baseDelayMs ?? 2000;
+    this.sleepFn = sleepFn;
+  }
+
+  getBackoffDelay(attempt: number): number {
+    return this.baseDelayMs * Math.pow(2, Math.max(0, attempt - 1));
+  }
+
+  async sendOutboundKycWebhook(
+    targetUrl: string,
+    payload: Record<string, unknown>,
+    customFetch?: typeof fetch
+  ): Promise<{
+    delivered: boolean;
+    attempts: number;
+    statusCode?: number;
+    logs: KycWebhookDeliveryLog[];
+    error?: string;
+  }> {
+    const fetchImpl = customFetch ?? fetch;
+    const bodyStr = JSON.stringify(payload);
+    const logs: KycWebhookDeliveryLog[] = [];
+    let lastStatusCode: number | undefined;
+    let lastError: string | undefined;
+
+    for (let attempt = 1; attempt <= this.maxRetries; attempt += 1) {
+      const timestamp = new Date().toISOString();
+      try {
+        const response = await fetchImpl(targetUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-KYC-Attempt': String(attempt),
+          },
+          body: bodyStr,
+        });
+
+        lastStatusCode = response.status;
+
+        if (response.ok) {
+          logs.push({
+            attempt,
+            timestamp,
+            statusCode: response.status,
+            success: true,
+          });
+          return {
+            delivered: true,
+            attempts: attempt,
+            statusCode: response.status,
+            logs,
+          };
+        }
+
+        lastError = `HTTP ${response.status}`;
+        logs.push({
+          attempt,
+          timestamp,
+          statusCode: response.status,
+          error: lastError,
+          success: false,
+        });
+
+        if (attempt < this.maxRetries) {
+          const delay = this.getBackoffDelay(attempt);
+          await this.sleepFn(delay);
+        }
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
+        logs.push({
+          attempt,
+          timestamp,
+          error: lastError,
+          success: false,
+        });
+
+        if (attempt < this.maxRetries) {
+          const delay = this.getBackoffDelay(attempt);
+          await this.sleepFn(delay);
+        }
+      }
+    }
+
+    return {
+      delivered: false,
+      attempts: this.maxRetries,
+      statusCode: lastStatusCode,
+      logs,
+      error: lastError ?? 'Exhausted retry attempts',
+    };
+  }
+}
+
+export class KycStatusPollingEngine {
+  private provider: IKycProvider;
+  private retryEngine: KycWebhookRetryEngine;
+
+  constructor(
+    provider: IKycProvider = kycProvider,
+    retryEngine: KycWebhookRetryEngine = new KycWebhookRetryEngine()
+  ) {
+    this.provider = provider;
+    this.retryEngine = retryEngine;
+  }
+
+  async pollAndNotifyStatusChange(
+    submissionData: KycSubmissionInput,
+    previousStatus: KycStatus,
+    partnerWebhookUrl?: string,
+    customFetch?: typeof fetch
+  ): Promise<{
+    currentStatus: KycStatus;
+    statusChanged: boolean;
+    webhookResult?: { delivered: boolean; attempts: number; statusCode?: number };
+  }> {
+    const res = await this.provider.submitCustomer(submissionData, {});
+    const currentStatus = res.status;
+    const statusChanged = currentStatus !== previousStatus;
+
+    if (statusChanged && partnerWebhookUrl) {
+      const webhookPayload = {
+        event: 'customer.kyc_status_updated',
+        account: submissionData.account,
+        previousStatus,
+        currentStatus,
+        occurredAt: new Date().toISOString(),
+      };
+      const delivery = await this.retryEngine.sendOutboundKycWebhook(
+        partnerWebhookUrl,
+        webhookPayload,
+        customFetch
+      );
+      return {
+        currentStatus,
+        statusChanged,
+        webhookResult: {
+          delivered: delivery.delivered,
+          attempts: delivery.attempts,
+          statusCode: delivery.statusCode,
+        },
+      };
+    }
+
+    return {
+      currentStatus,
+      statusChanged,
+    };
+  }
+}
+

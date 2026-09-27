@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import { trace, SpanKind, SpanStatusCode, context } from '@opentelemetry/api';
 import { propagation } from '@opentelemetry/api';
 import { tracingManager } from '../../utils/tracing';
+import { v4 as uuidv4 } from 'uuid';
 
 const tracer = trace.getTracer('anchorpoint-backend-express');
 
@@ -10,10 +11,10 @@ export const tracingMiddleware = (req: Request, res: Response, next: NextFunctio
   const method = req.method;
   const spanName = `${method} ${route}`;
 
-  // Extract context from incoming headers
+  const correlationId = (req.headers['x-correlation-id'] as string | undefined) || uuidv4();
+
   const extractedContext = propagation.extract(context.active(), req.headers);
   
-  // Create span with extracted context
   const span = tracer.startSpan(spanName, {
     kind: SpanKind.SERVER,
     attributes: {
@@ -28,24 +29,21 @@ export const tracingMiddleware = (req: Request, res: Response, next: NextFunctio
     },
   }, extractedContext);
 
-  // Set the span in the current context
   const newContext = trace.setSpan(extractedContext, span);
   
-  // Store trace context for later use
   const tracingContext = {
     span,
     traceId: span.spanContext().traceId,
     spanId: span.spanContext().spanId,
     otelContext: newContext,
+    correlationId,
   };
 
-  // Run the request handler with tracing context
   tracingManager.runWithContext(tracingContext, () => {
-    // Add request ID to response headers for correlation
     res.setHeader('X-Trace-Id', span.spanContext().traceId);
     res.setHeader('X-Span-Id', span.spanContext().spanId);
+    res.setHeader('X-Correlation-Id', correlationId);
 
-    // Override res.end to capture response status
     const originalEnd = res.end;
     res.end = function(chunk?: any, encoding?: any, cb?: any) {
       span.setAttribute('http.status_code', res.statusCode);
@@ -63,7 +61,6 @@ export const tracingMiddleware = (req: Request, res: Response, next: NextFunctio
       return originalEnd.call(this, chunk, encoding, cb);
     };
 
-    // Handle request errors
     res.on('error', (error) => {
       span.recordException(error);
       span.setStatus({

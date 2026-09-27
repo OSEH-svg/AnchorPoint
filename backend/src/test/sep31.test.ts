@@ -1,7 +1,7 @@
 import "@jest/globals";
 import request from "supertest";
 import express, { Express } from "express";
-import sep31Router from "../src/sep31/router";
+import sep31Router from "../sep31/router";
 import { expect, it } from "@jest/globals";
 
 // ─── Test app ─────────────────────────────────────────────────────────────
@@ -70,7 +70,11 @@ describe("POST /sep31/transactions", () => {
   });
 
   it("returns 400 when amount is missing", async () => {
-    const { amount, ...body } = validBody;
+    const body = {
+      asset_code: validBody.asset_code,
+      sender_id: validBody.sender_id,
+      receiver_id: validBody.receiver_id,
+    };
     const res = await request(app).post("/sep31/transactions").send(body);
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/amount/);
@@ -85,7 +89,11 @@ describe("POST /sep31/transactions", () => {
   });
 
   it("returns 400 when asset_code is missing", async () => {
-    const { asset_code, ...body } = validBody;
+    const body = {
+      amount: validBody.amount,
+      sender_id: validBody.sender_id,
+      receiver_id: validBody.receiver_id,
+    };
     const res = await request(app).post("/sep31/transactions").send(body);
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/asset_code/);
@@ -100,14 +108,22 @@ describe("POST /sep31/transactions", () => {
   });
 
   it("returns 400 when neither sender_id nor sender_info is provided", async () => {
-    const { sender_id, ...body } = validBody;
+    const body = {
+      amount: validBody.amount,
+      asset_code: validBody.asset_code,
+      receiver_id: validBody.receiver_id,
+    };
     const res = await request(app).post("/sep31/transactions").send(body);
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/sender/);
   });
 
   it("returns 400 when neither receiver_id nor receiver_info is provided", async () => {
-    const { receiver_id, ...body } = validBody;
+    const body = {
+      amount: validBody.amount,
+      asset_code: validBody.asset_code,
+      sender_id: validBody.sender_id,
+    };
     const res = await request(app).post("/sep31/transactions").send(body);
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/receiver/);
@@ -154,6 +170,40 @@ describe("POST /sep31/transactions", () => {
     const r2 = await request(app).post("/sep31/transactions").send(validBody);
     expect(r1.body.id).not.toBe(r2.body.id);
   });
+
+  it("returns 400 when sender_id and receiver_id are the same", async () => {
+    const res = await request(app)
+      .post("/sep31/transactions")
+      .send({ ...validBody, sender_id: "same-id", receiver_id: "same-id" });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/sender_id and receiver_id must refer to different/);
+  });
+
+  it("returns 400 when sender_info and receiver_info describe the same person", async () => {
+    const sameInfo = { first_name: "Alice", last_name: "Smith", email: "alice@example.com" };
+    const res = await request(app)
+      .post("/sep31/transactions")
+      .send({
+        amount: "100",
+        asset_code: "USDC",
+        sender_info: sameInfo,
+        receiver_info: { ...sameInfo, account_number: "123", routing_number: "021" },
+      });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/sender_info and receiver_info must refer to different/);
+  });
+
+  it("returns 201 when sender_info and receiver_info are different people", async () => {
+    const res = await request(app)
+      .post("/sep31/transactions")
+      .send({
+        amount: "100",
+        asset_code: "USDC",
+        sender_info: { first_name: "Alice", last_name: "Sender" },
+        receiver_info: { first_name: "Bob", last_name: "Receiver", account_number: "99", routing_number: "021" },
+      });
+    expect(res.status).toBe(201);
+  });
 });
 
 // ─── GET /sep31/transactions/:id ──────────────────────────────────────────
@@ -187,6 +237,8 @@ describe("GET /sep31/transactions/:id", () => {
     const res = await request(app).get(`/sep31/transactions/${transactionId}`);
     expect(res.body.transaction.amount_out).toBeDefined();
     expect(res.body.transaction.amount_fee).toBeDefined();
+    expect(res.body.transaction.amount_out).toMatch(/^\d+\.\d{7}$/);
+    expect(res.body.transaction.amount_fee).toMatch(/^\d+\.\d{7}$/);
   });
 });
 

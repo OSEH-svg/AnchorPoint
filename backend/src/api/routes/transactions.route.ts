@@ -5,6 +5,7 @@ import { authMiddleware, AuthRequest } from '../middleware/auth.middleware';
 import { validate } from '../middleware/validate.middleware';
 import { stellarService } from '../../services/stellar.service';
 import { submissionLimiter } from '../middleware/rate-limit.middleware';
+import { emitTxUpdated } from '../../lib/socket';
 
 
 const router = Router();
@@ -22,6 +23,8 @@ const querySchema = z.object({
 const submitSchema = z.object({
   xdr: z.string().min(1, 'Transaction XDR is required'),
 });
+
+const escapeLikePattern = (value: string) => value.replace(/'/g, "''");
 
 
 /**
@@ -121,33 +124,28 @@ router.get('/', authMiddleware, validate({ query: querySchema }), async (req: Au
     }
 
     const eventSearchClauses: string[] = [];
-    const eventQueryParams: string[] = [];
 
     if (sender) {
-      const senderPattern = `%${sender}%`;
-      eventSearchClauses.push('(topics LIKE ? OR value LIKE ?)');
-      eventQueryParams.push(senderPattern, senderPattern);
+      const senderPattern = `'%${escapeLikePattern(sender)}%'`;
+      eventSearchClauses.push(`(topics LIKE ${senderPattern} OR value LIKE ${senderPattern})`);
     }
 
     if (receiver) {
-      const receiverPattern = `%${receiver}%`;
-      eventSearchClauses.push('(topics LIKE ? OR value LIKE ?)');
-      eventQueryParams.push(receiverPattern, receiverPattern);
+      const receiverPattern = `'%${escapeLikePattern(receiver)}%'`;
+      eventSearchClauses.push(`(topics LIKE ${receiverPattern} OR value LIKE ${receiverPattern})`);
     }
 
     if (memo) {
-      const memoPattern = `%${memo}%`;
-      eventSearchClauses.push('(topics LIKE ? OR value LIKE ?)');
-      eventQueryParams.push(memoPattern, memoPattern);
+      const memoPattern = `'%${escapeLikePattern(memo)}%'`;
+      eventSearchClauses.push(`(topics LIKE ${memoPattern} OR value LIKE ${memoPattern})`);
     }
 
-    let matchingTxHashes: string[] | undefined;
+    let matchingTxHashes: string[] = [];
 
     if (eventSearchClauses.length > 0) {
-      const eventRows = await prisma.$queryRaw<Array<{ txHash: string }>>(
-        `SELECT DISTINCT txHash FROM "ContractEvent" WHERE ${eventSearchClauses.join(' AND ')}`,
-        ...eventQueryParams,
-      );
+      const eventRows = (await prisma.$queryRawUnsafe(
+        `SELECT DISTINCT txHash FROM "ContractEvent" WHERE ${eventSearchClauses.join(' AND ')}`
+      )) as { txHash: string }[];
 
       matchingTxHashes = eventRows.map((row: { txHash: string }) => row.txHash).filter(Boolean);
       if (matchingTxHashes.length === 0) {
@@ -164,7 +162,7 @@ router.get('/', authMiddleware, validate({ query: querySchema }), async (req: Au
     const whereClause: any = {
       userId: user.id,
       ...(assetCode && { assetCode }),
-      ...(matchingTxHashes ? { stellarTxId: { in: matchingTxHashes } } : {}),
+      ...(matchingTxHashes.length > 0 ? { stellarTxId: { in: matchingTxHashes } } : {}),
     };
 
     const skip = (page - 1) * limit;
@@ -276,5 +274,74 @@ router.post('/submit', authMiddleware, submissionLimiter, validate({ body: submi
   }
 });
 
-export default router;
+const statusUpdateSchema = z.object({
+  status: z.enum(['PENDING', 'COMPLETED', 'FAILED']),
+});
 
+/**
+ * @swagger
+ * /api/transactions/{id}/status:
+ *   patch:
+ *     summary: Update transaction status
+ *     description: Updates the status of a transaction and emits a real-time WebSocket event.
+ *     tags: [Transactions]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Transaction ID
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - status
+ *             properties:
+ *               status:
+ *                 type: string
+ *                 enum: [PENDING, COMPLETED, FAILED]
+ *     responses:
+ *       200:
+ *         description: Transaction status updated successfully
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: Transaction not found
+ */
+router.patch('/:id/status', authMiddleware, validate({ body: statusUpdateSchema }), async (req: AuthRequest, res: Response) => {
+  const { id } = req.params;
+  const { status } = req.body as { status: string };
+  const publicKey = req.user!.publicKey;
+
+  try {
+    const user = await prisma.user.findUnique({ where: { publicKey } });
+    if (!user) {
+      return res.status(404).json({ status: 'error', message: 'User not found' });
+    }
+
+    const existing = await prisma.transaction.findFirst({ where: { id, userId: user.id } });
+    if (!existing) {
+      return res.status(404).json({ status: 'error', message: 'Transaction not found' });
+    }
+
+    const tx = await prisma.transaction.update({
+      where: { id },
+      data: { status },
+    });
+
+    emitTxUpdated({ id: tx.id, status: tx.status, assetCode: tx.assetCode, amount: tx.amount, type: tx.type });
+
+    return res.json({ status: 'success', data: tx });
+  } catch (error) {
+    console.error('Error updating transaction status:', error);
+    return res.status(500).json({ status: 'error', message: 'Failed to update transaction status' });
+  }
+});
+
+export default router;

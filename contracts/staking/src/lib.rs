@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Vec,
 };
 
 // Fixed-point precision: 1e18
@@ -29,6 +29,19 @@ pub enum DataKey {
     UserRewardPerTokenPaid(Address, Address), // (User, RewardToken)
     /// Accrued but unclaimed rewards for a user and reward token
     Rewards(Address, Address), // (User, RewardToken)
+    /// Branding / project metadata (description, icon_url, website)
+    ContractMeta,
+    /// Whether contract is paused for emergency
+    Paused,
+}
+
+/// On-chain branding metadata for the contract.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContractMetadata {
+    pub description: String,
+    pub icon_url: String,
+    pub website: String,
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -49,9 +62,16 @@ impl MultiTokenStaking {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::StakeToken, &stake_token);
         env.storage().instance().set(&DataKey::TotalStaked, &0_i128);
+        env.storage().instance().set(&DataKey::Paused, &false);
         
         let reward_tokens: Vec<Address> = Vec::new(&env);
         env.storage().instance().set(&DataKey::RewardTokens, &reward_tokens);
+
+        env.storage().instance().set(&DataKey::ContractMeta, &ContractMetadata {
+            description: String::from_str(&env, ""),
+            icon_url: String::from_str(&env, ""),
+            website: String::from_str(&env, ""),
+        });
     }
 
     /// Whitelist a new reward token.
@@ -59,6 +79,7 @@ impl MultiTokenStaking {
         admin.require_auth();
         let expected_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         assert_eq!(admin, expected_admin, "unauthorized");
+        Self::_check_not_paused(&env);
 
         let is_whitelisted = env
             .storage()
@@ -89,6 +110,7 @@ impl MultiTokenStaking {
     pub fn deposit_rewards(env: Env, from: Address, reward_token: Address, amount: i128) {
         from.require_auth();
         assert!(amount > 0, "amount must be positive");
+        Self::_check_not_paused(&env);
 
         let is_whitelisted = env
             .storage()
@@ -125,13 +147,38 @@ impl MultiTokenStaking {
                 .set(&DataKey::RewardPerTokenStored(reward_token.clone()), &rpt);
         }
 
-        // Topic: event name only; from + amount in data.
+        // Topic: event name only; from + reward_token + amount in data.
+        env.events()
+            .publish((symbol_short!("dep_rwd"),), (from.clone(), reward_token.clone(), amount));
         env.events().publish(
-            symbol_short!("dep_rwd"),
-            (from, amount),
             (symbol_short!("dep_rwd"), from, reward_token),
             amount,
         );
+    }
+
+    // ── Admin: Pause/Unpause ─────────────────────────────────────────────
+
+    /// Pause contract operations (emergency).
+    pub fn pause(env: Env, admin: Address) {
+        admin.require_auth();
+        let expected_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        assert_eq!(admin, expected_admin, "unauthorized");
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish((symbol_short!("paused"),), ());
+    }
+
+    /// Unpause contract operations.
+    pub fn unpause(env: Env, admin: Address) {
+        admin.require_auth();
+        let expected_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        assert_eq!(admin, expected_admin, "unauthorized");
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish((symbol_short!("unpaused"),), ());
+    }
+
+    /// Check if contract is paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
     }
 
     // ── Staking ───────────────────────────────────────────────────────────
@@ -139,6 +186,7 @@ impl MultiTokenStaking {
     pub fn stake(env: Env, user: Address, amount: i128) {
         user.require_auth();
         assert!(amount > 0, "amount must be positive");
+        Self::_check_not_paused(&env);
 
         Self::_update_rewards(&env, &user);
 
@@ -164,12 +212,13 @@ impl MultiTokenStaking {
             .set(&DataKey::TotalStaked, &total.checked_add(amount).expect("total staked overflow"));
 
         // Topic: event name only; user + amount in data.
-        env.events().publish(symbol_short!("staked"), (user, amount));
+        env.events().publish((symbol_short!("staked"),), (user, amount));
     }
 
     pub fn unstake(env: Env, user: Address, amount: i128) {
         user.require_auth();
         assert!(amount > 0, "amount must be positive");
+        Self::_check_not_paused(&env);
 
         let prev = Self::_stake_of(&env, &user);
         assert!(prev >= amount, "insufficient stake");
@@ -197,7 +246,43 @@ impl MultiTokenStaking {
         );
 
         // Topic: event name only; user + amount in data.
-        env.events().publish(symbol_short!("unstaked"), (user, amount));
+        env.events().publish((symbol_short!("unstaked"),), (user, amount));
+    }
+
+    // ── Emergency Withdraw ─────────────────────────────────────────────────
+
+    /// Withdraw entire stake directly when contract is paused, without reward updates.
+    /// This function is EXCLUSIVELY available when the contract is paused.
+    pub fn emergency_withdraw(env: Env, user: Address) {
+        user.require_auth();
+        Self::_require_paused(&env);
+
+        let amount = Self::_stake_of(&env, &user);
+        assert!(amount > 0, "no stake to withdraw");
+
+        // Update storage
+        env.storage()
+            .persistent()
+            .set(&DataKey::Stake(user.clone()), &0_i128);
+
+        let total: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalStaked)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalStaked, &total.checked_sub(amount).expect("total staked underflow"));
+
+        // Transfer tokens
+        let stake_token: Address = env.storage().instance().get(&DataKey::StakeToken).unwrap();
+        token::Client::new(&env, &stake_token).transfer(
+            &env.current_contract_address(),
+            &user,
+            &amount,
+        );
+
+        env.events().publish((symbol_short!("emer_wd"),), (user, amount));
     }
 
     // ── Claiming ──────────────────────────────────────────────────────────
@@ -205,19 +290,25 @@ impl MultiTokenStaking {
     /// Claim a specific reward token.
     pub fn claim(env: Env, user: Address, reward_token: Address) -> i128 {
         user.require_auth();
+        Self::_check_not_paused(&env);
         Self::_update_reward_for_token(&env, &user, &reward_token);
 
-        let reward: i128 = env
+        let accrued: i128 = env
             .storage()
             .persistent()
             .get(&DataKey::Rewards(user.clone(), reward_token.clone()))
             .unwrap_or(0);
 
-        if reward > 0 {
-            env.storage()
-                .persistent()
-                .set(&DataKey::Rewards(user.clone(), reward_token.clone()), &0_i128);
+        // Divide the scaled accrued amount into whole tokens and keep the
+        // sub-stroop remainder so it is not lost (and not locked up).
+        let reward = accrued / PRECISION;
+        let remainder = accrued % PRECISION;
 
+        env.storage()
+            .persistent()
+            .set(&DataKey::Rewards(user.clone(), reward_token.clone()), &remainder);
+
+        if reward > 0 {
             token::Client::new(&env, &reward_token).transfer(
                 &env.current_contract_address(),
                 &user,
@@ -225,8 +316,8 @@ impl MultiTokenStaking {
             );
 
             env.events()
-                .publish(symbol_short!("claimed"), (user, reward));
                 .publish((symbol_short!("claimed"), user, reward_token), reward);
+                .publish((symbol_short!("claimed"), user.clone(), reward_token.clone()), reward);
         }
 
         reward
@@ -235,32 +326,35 @@ impl MultiTokenStaking {
     /// Claim all whitelisted reward tokens.
     pub fn claim_all(env: Env, user: Address) {
         user.require_auth();
+        Self::_check_not_paused(&env);
         let reward_tokens: Vec<Address> = env.storage().instance().get(&DataKey::RewardTokens).unwrap_or_else(|| Vec::new(&env));
         
         for reward_token in reward_tokens.iter() {
             // Claim each one internally without separate require_auth since it's already done
             Self::_update_reward_for_token(&env, &user, &reward_token);
 
-            let reward: i128 = env
+            let accrued: i128 = env
                 .storage()
                 .persistent()
                 .get(&DataKey::Rewards(user.clone(), reward_token.clone()))
                 .unwrap_or(0);
 
-            if reward > 0 {
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::Rewards(user.clone(), reward_token.clone()), &0_i128);
+            // Divide the scaled accrued amount and store the sub-stroop remainder.
+            let reward = accrued / PRECISION;
+            let remainder = accrued % PRECISION;
 
+            env.storage()
+                .persistent()
+                .set(&DataKey::Rewards(user.clone(), reward_token.clone()), &remainder);
+
+            if reward > 0 {
                 token::Client::new(&env, &reward_token).transfer(
                     &env.current_contract_address(),
                     &user,
                     &reward,
                 );
 
-                // Topic: event name only; user + reward in data.
                 env.events()
-                    .publish(symbol_short!("claimed"), (user.clone(), reward));
                     .publish((symbol_short!("claimed"), user.clone(), reward_token.clone()), reward);
             }
         }
@@ -286,7 +380,7 @@ impl MultiTokenStaking {
             .get(&DataKey::Rewards(user, reward_token))
             .unwrap_or(0);
 
-        accrued + stake.checked_mul(rpt - user_rpt).expect("rewards overflow") / PRECISION
+        (accrued + stake.checked_mul(rpt - user_rpt).expect("rewards overflow")) / PRECISION
     }
 
     pub fn total_staked(env: Env) -> i128 {
@@ -304,7 +398,51 @@ impl MultiTokenStaking {
         env.storage().instance().get(&DataKey::RewardTokens).unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Update the contract's branding metadata (admin only).
+    pub fn update_contract_meta(
+        env: Env,
+        caller: Address,
+        description: String,
+        icon_url: String,
+        website: String,
+    ) {
+        caller.require_auth();
+
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("admin not found");
+        assert!(caller == admin, "only admin can update contract metadata");
+
+        let meta = ContractMetadata { description, icon_url, website };
+        env.storage().instance().set(&DataKey::ContractMeta, &meta);
+
+        env.events().publish((symbol_short!("meta_upd"),), meta);
+    }
+
+    /// Return the current contract branding metadata.
+    pub fn get_contract_meta(env: Env) -> ContractMetadata {
+        env.storage()
+            .instance()
+            .get(&DataKey::ContractMeta)
+            .expect("contract metadata not initialised")
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────────
+
+    fn _check_not_paused(env: &Env) {
+        if Self::is_paused(env.clone()) {
+            panic!("contract is paused");
+        }
+    }
+
+    /// Asserts that the contract IS paused (for emergency operations only).
+    fn _require_paused(env: &Env) {
+        if !Self::is_paused(env.clone()) {
+            panic!("contract not paused");
+        }
+    }
 
     fn _update_rewards(env: &Env, user: &Address) {
         let reward_tokens: Vec<Address> = env
@@ -332,9 +470,13 @@ impl MultiTokenStaking {
             .unwrap_or(0);
 
         let stake = Self::_stake_of(env, user);
-        let earned = stake.checked_mul(rpt - user_rpt).expect("rewards overflow") / PRECISION;
+        // Keep the accrued value in scaled (fixed-point) form so that sub-stroop
+        // fractional remainders are not truncated away on every update. Only the
+        // final claim divides by PRECISION and stores the leftover remainder back,
+        // which prevents reward tokens from being permanently locked up.
+        let delta = stake.checked_mul(rpt - user_rpt).expect("rewards overflow");
 
-        if earned > 0 {
+        if delta > 0 {
             let prev: i128 = env
                 .storage()
                 .persistent()
@@ -342,7 +484,7 @@ impl MultiTokenStaking {
                 .unwrap_or(0);
             env.storage()
                 .persistent()
-                .set(&DataKey::Rewards(user.clone(), reward_token.clone()), &prev.checked_add(earned).expect("rewards overflow"));
+                .set(&DataKey::Rewards(user.clone(), reward_token.clone()), &prev.checked_add(delta).expect("rewards overflow"));
         }
 
         // Snapshot current global rate for this user
@@ -456,5 +598,197 @@ mod tests {
 
         assert_eq!(client.pending_rewards(&alice, &rwd1), 1_500);
         assert_eq!(client.pending_rewards(&bob, &rwd1), 500);
+    }
+
+    #[test]
+    fn test_sub_stroop_remainder_accrual() {
+        let (env, contract_id, admin, alice, bob, rwd1, _) = setup();
+        let client = MultiTokenStakingClient::new(&env, &contract_id);
+        let rwd1_client = TokenClient::new(&env, &rwd1);
+
+        // Two equal stakers: total stake of 2, rewards of 1 stroop each deposit.
+        // Each deposit accrues 0.5 stroop per user which truncates to 0 when naively
+        // divided, so the remainder must be preserved across updates.
+        client.stake(&alice, &1);
+        client.stake(&bob, &1);
+
+        client.deposit_rewards(&admin, &rwd1, &1);
+        client.deposit_rewards(&admin, &rwd1, &1);
+
+        // Each user should have accrued exactly 1 whole stroop after both deposits.
+        assert_eq!(client.pending_rewards(&alice, &rwd1), 1);
+        assert_eq!(client.pending_rewards(&bob, &rwd1), 1);
+
+        client.claim(&alice, &rwd1);
+        client.claim(&bob, &rwd1);
+
+        assert_eq!(rwd1_client.balance(&alice), 1);
+        assert_eq!(rwd1_client.balance(&bob), 1);
+
+        // No rewards should remain locked in the contract for this token.
+        assert_eq!(client.pending_rewards(&alice, &rwd1), 0);
+        assert_eq!(client.pending_rewards(&bob, &rwd1), 0);
+    fn test_update_contract_meta() {
+        let (env, contract_id, admin, _, _, _, _) = setup();
+        let client = MultiTokenStakingClient::new(&env, &contract_id);
+
+        let initial = client.get_contract_meta();
+        assert_eq!(initial.description, String::from_str(&env, ""));
+        assert_eq!(initial.icon_url, String::from_str(&env, ""));
+        assert_eq!(initial.website, String::from_str(&env, ""));
+
+        client.update_contract_meta(
+            &admin,
+            &String::from_str(&env, "Multi-token staking on Stellar"),
+            &String::from_str(&env, "https://example.com/icon.png"),
+            &String::from_str(&env, "https://example.com"),
+        );
+
+        let updated = client.get_contract_meta();
+        assert_eq!(updated.description, String::from_str(&env, "Multi-token staking on Stellar"));
+        assert_eq!(updated.icon_url, String::from_str(&env, "https://example.com/icon.png"));
+        assert_eq!(updated.website, String::from_str(&env, "https://example.com"));
+    }
+
+    #[test]
+    #[should_panic(expected = "only admin can update contract metadata")]
+    fn test_update_contract_meta_non_admin() {
+        let (env, contract_id, _, alice, _, _, _) = setup();
+        let client = MultiTokenStakingClient::new(&env, &contract_id);
+
+        client.update_contract_meta(
+            &alice,
+            &String::from_str(&env, "Hacked"),
+            &String::from_str(&env, ""),
+            &String::from_str(&env, ""),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "contract is paused")]
+    fn test_normal_unstake_when_paused() {
+        let (env, contract_id, admin, alice, _bob, _rwd1, _rwd2) = setup();
+        let client = MultiTokenStakingClient::new(&env, &contract_id);
+        client.stake(&alice, &500_000);
+        client.pause(&admin);
+        client.unstake(&alice, &100_000); // Should panic
+    }
+
+    #[test]
+    fn test_pause_and_emergency_withdraw() {
+        let (env, contract_id, admin, alice, _bob, _rwd1, _rwd2) = setup();
+        let client = MultiTokenStakingClient::new(&env, &contract_id);
+
+        // Stake first
+        client.stake(&alice, &500_000);
+        assert_eq!(client.stake_of(&alice), 500_000);
+
+        // Pause contract
+        client.pause(&admin);
+        assert!(client.is_paused());
+
+        // Try emergency withdraw - should work
+        client.emergency_withdraw(&alice);
+        assert_eq!(client.stake_of(&alice), 0);
+
+        // Unpause
+        client.unpause(&admin);
+        assert!(!client.is_paused());
+    }
+
+    #[test]
+    #[should_panic(expected = "contract not paused")]
+    fn test_emergency_withdraw_not_paused() {
+        let (env, contract_id, _admin, alice, _bob, _rwd1, _rwd2) = setup();
+        let client = MultiTokenStakingClient::new(&env, &contract_id);
+        client.stake(&alice, &100_000);
+        client.emergency_withdraw(&alice); // Should panic
+    }
+
+    // ── Comprehensive pause behavior tests (Issue #1001) ─────────────────
+
+    #[test]
+    #[should_panic(expected = "contract is paused")]
+    fn test_stake_blocked_when_paused() {
+        let (env, contract_id, admin, alice, _bob, _rwd1, _rwd2) = setup();
+        let client = MultiTokenStakingClient::new(&env, &contract_id);
+        client.pause(&admin);
+        client.stake(&alice, &100_000); // Must be blocked
+    }
+
+    #[test]
+    #[should_panic(expected = "contract is paused")]
+    fn test_claim_blocked_when_paused() {
+        let (env, contract_id, admin, alice, _bob, rwd1, _rwd2) = setup();
+        let client = MultiTokenStakingClient::new(&env, &contract_id);
+        client.stake(&alice, &100_000);
+        client.pause(&admin);
+        client.claim(&alice, &rwd1); // Must be blocked
+    }
+
+    #[test]
+    #[should_panic(expected = "contract is paused")]
+    fn test_claim_all_blocked_when_paused() {
+        let (env, contract_id, admin, alice, _bob, _rwd1, _rwd2) = setup();
+        let client = MultiTokenStakingClient::new(&env, &contract_id);
+        client.stake(&alice, &100_000);
+        client.pause(&admin);
+        client.claim_all(&alice); // Must be blocked
+    }
+
+    #[test]
+    #[should_panic(expected = "contract is paused")]
+    fn test_deposit_rewards_blocked_when_paused() {
+        let (env, contract_id, admin, _alice, _bob, rwd1, _rwd2) = setup();
+        let client = MultiTokenStakingClient::new(&env, &contract_id);
+        client.pause(&admin);
+        client.deposit_rewards(&admin, &rwd1, &1_000); // Must be blocked
+    }
+
+    #[test]
+    fn test_pause_and_unpause_cycle() {
+        let (env, contract_id, admin, alice, _bob, rwd1, _rwd2) = setup();
+        let client = MultiTokenStakingClient::new(&env, &contract_id);
+
+        // Operations succeed before pause
+        client.stake(&alice, &100_000);
+        assert_eq!(client.stake_of(&alice), 100_000);
+
+        // Pause the contract
+        client.pause(&admin);
+        assert!(client.is_paused());
+
+        // Emergency withdraw works only when paused
+        client.emergency_withdraw(&alice);
+        assert_eq!(client.stake_of(&alice), 0);
+
+        // Unpause restores normal operations
+        client.unpause(&admin);
+        assert!(!client.is_paused());
+
+        // Normal staking works again after unpause
+        client.stake(&alice, &50_000);
+        assert_eq!(client.stake_of(&alice), 50_000);
+    }
+
+    #[test]
+    fn test_emergency_withdraw_only_when_paused_full_flow() {
+        let (env, contract_id, admin, alice, bob, _rwd1, _rwd2) = setup();
+        let client = MultiTokenStakingClient::new(&env, &contract_id);
+
+        // Both users stake
+        client.stake(&alice, &300_000);
+        client.stake(&bob, &200_000);
+
+        // Admin pauses; emergency_withdraw works for both
+        client.pause(&admin);
+
+        client.emergency_withdraw(&alice);
+        assert_eq!(client.stake_of(&alice), 0);
+        assert_eq!(client.total_staked(), 200_000);
+
+        client.emergency_withdraw(&bob);
+        assert_eq!(client.stake_of(&bob), 0);
+        assert_eq!(client.total_staked(), 0);
     }
 }

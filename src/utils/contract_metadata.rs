@@ -46,11 +46,14 @@ where
     K: IntoVal<Env, Val> + TryFromVal<Env, Val>,
 {
     if !env.storage().instance().has(key) {
-        env.storage().instance().set(key, &ContractMetadata {
-            description: String::from_str(env, ""),
-            icon_url: String::from_str(env, ""),
-            website: String::from_str(env, ""),
-        });
+        env.storage().instance().set(
+            key,
+            &ContractMetadata {
+                description: String::from_str(env, ""),
+                icon_url: String::from_str(env, ""),
+                website: String::from_str(env, ""),
+            },
+        );
     }
 }
 
@@ -80,6 +83,7 @@ where
 /// * `description` – New description (pass current value to leave unchanged)
 /// * `icon_url`    – New icon URL
 /// * `website`     – New website URL
+#[allow(deprecated)]
 pub fn update<K>(
     env: &Env,
     key: &K,
@@ -92,8 +96,13 @@ pub fn update<K>(
 {
     admin.require_auth();
 
-    let meta = ContractMetadata { description, icon_url, website };
+    let meta = ContractMetadata {
+        description,
+        icon_url,
+        website,
+    };
     env.storage().instance().set(key, &meta);
 
+    #[allow(deprecated)]
     env.events().publish((symbol_short!("meta_upd"),), meta);
 }

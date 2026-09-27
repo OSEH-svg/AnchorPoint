@@ -13,6 +13,10 @@ const preferencesSchema = z.object({
   phone: z.string().optional(),
 });
 
+const markReadSchema = z.object({
+  notificationIds: z.array(z.string().min(1)).min(1),
+});
+
 /**
  * @swagger
  * /api/notifications/preferences:
@@ -141,6 +145,39 @@ router.get(
       res
         .status(500)
         .json({ status: "error", message: "Failed to fetch history" });
+    }
+  },
+);
+
+router.patch(
+  "/history",
+  authMiddleware,
+  validate({ body: markReadSchema }),
+  async (req: AuthRequest, res: Response) => {
+    const publicKey = req.user!.publicKey;
+    const { notificationIds } = req.body;
+
+    try {
+      const user = await prisma.user.findUnique({ where: { publicKey } });
+      if (!user) {
+        return res
+          .status(404)
+          .json({ status: "error", message: "User not found" });
+      }
+
+      await prisma.notification.updateMany({
+        where: {
+          userId: user.id,
+          id: { in: notificationIds },
+        },
+        data: { status: "SENT" },
+      });
+
+      res.json({ status: "success", message: "Notifications marked as read" });
+    } catch (error) {
+      res
+        .status(500)
+        .json({ status: "error", message: "Failed to mark notifications as read" });
     }
   },
 );

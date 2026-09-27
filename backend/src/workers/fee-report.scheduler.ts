@@ -6,7 +6,7 @@ const feeReportService = new FeeReportService();
 
 /**
  * Fee Report Scheduler
- * Automatically generates daily and monthly fee reports using cron jobs
+ * Enqueues daily and monthly fee report generation jobs into BullMQ on schedule.
  */
 export class FeeReportScheduler {
   private dailyTask: ScheduledTask | null = null;
@@ -47,20 +47,11 @@ export class FeeReportScheduler {
     // Run at 00:00 every day
     this.dailyTask = cron.schedule('0 0 * * *', async () => {
       try {
-        logger.info('Generating daily fee report');
-        const reportData = await feeReportService.generateDailyReport();
-        
-        // Export as both JSON and PDF
-        const jsonPath = await feeReportService.exportAsJSON(reportData);
-        const pdfPath = await feeReportService.exportAsPDF(reportData);
-        
-        logger.info('Daily fee report generated successfully', {
-          jsonPath,
-          pdfPath,
-          totalFeesXLM: reportData.totalFeesXLM,
-        });
+        logger.info('Scheduling daily fee report job in queue');
+        const job = await feeReportService.enqueueDailyReportJob();
+        logger.info('Daily fee report job enqueued successfully', { jobId: job.id });
       } catch (error) {
-        logger.error('Failed to generate daily fee report', { error });
+        logger.error('Failed to enqueue daily fee report job', { error });
       }
     });
 
@@ -74,24 +65,15 @@ export class FeeReportScheduler {
     // Run at 00:00 on the 1st of every month
     this.monthlyTask = cron.schedule('0 0 1 * *', async () => {
       try {
-        logger.info('Generating monthly fee report');
+        logger.info('Scheduling monthly fee report job in queue');
         const now = new Date();
-        const reportData = await feeReportService.generateMonthlyReport(
+        const job = await feeReportService.enqueueMonthlyReportJob(
           now.getFullYear(),
           now.getMonth() - 1 // Previous month
         );
-        
-        // Export as both JSON and PDF
-        const jsonPath = await feeReportService.exportAsJSON(reportData);
-        const pdfPath = await feeReportService.exportAsPDF(reportData);
-        
-        logger.info('Monthly fee report generated successfully', {
-          jsonPath,
-          pdfPath,
-          totalFeesXLM: reportData.totalFeesXLM,
-        });
+        logger.info('Monthly fee report job enqueued successfully', { jobId: job.id });
       } catch (error) {
-        logger.error('Failed to generate monthly fee report', { error });
+        logger.error('Failed to enqueue monthly fee report job', { error });
       }
     });
 
@@ -99,45 +81,37 @@ export class FeeReportScheduler {
   }
 
   /**
-   * Manually trigger a daily report (useful for testing)
+   * Close the underlying BullMQ queue connection. Call during graceful
+   * shutdown, after `stop()` has cancelled the cron tasks.
+   */
+  async closeQueue(): Promise<void> {
+    await feeReportService.closeQueue();
+  }
+
+  /**
+   * Manually trigger a daily report job into BullMQ queue
    */
   async triggerDailyReport(date?: Date): Promise<void> {
     try {
-      logger.info('Manually triggering daily fee report');
-      const reportData = await feeReportService.generateDailyReport(date);
-      
-      const jsonPath = await feeReportService.exportAsJSON(reportData);
-      const pdfPath = await feeReportService.exportAsPDF(reportData);
-      
-      logger.info('Manual daily fee report generated successfully', {
-        jsonPath,
-        pdfPath,
-        totalFeesXLM: reportData.totalFeesXLM,
-      });
+      logger.info('Manually triggering daily fee report job in queue');
+      const job = await feeReportService.enqueueDailyReportJob(date);
+      logger.info('Manual daily fee report job enqueued successfully', { jobId: job.id });
     } catch (error) {
-      logger.error('Failed to generate manual daily fee report', { error });
+      logger.error('Failed to enqueue manual daily fee report job', { error });
       throw error;
     }
   }
 
   /**
-   * Manually trigger a monthly report (useful for testing)
+   * Manually trigger a monthly report job into BullMQ queue
    */
   async triggerMonthlyReport(year?: number, month?: number): Promise<void> {
     try {
-      logger.info('Manually triggering monthly fee report');
-      const reportData = await feeReportService.generateMonthlyReport(year, month);
-      
-      const jsonPath = await feeReportService.exportAsJSON(reportData);
-      const pdfPath = await feeReportService.exportAsPDF(reportData);
-      
-      logger.info('Manual monthly fee report generated successfully', {
-        jsonPath,
-        pdfPath,
-        totalFeesXLM: reportData.totalFeesXLM,
-      });
+      logger.info('Manually triggering monthly fee report job in queue');
+      const job = await feeReportService.enqueueMonthlyReportJob(year, month);
+      logger.info('Manual monthly fee report job enqueued successfully', { jobId: job.id });
     } catch (error) {
-      logger.error('Failed to generate manual monthly fee report', { error });
+      logger.error('Failed to enqueue manual monthly fee report job', { error });
       throw error;
     }
   }
