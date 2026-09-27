@@ -33,6 +33,10 @@ pub enum DataKey {
     CollateralToken,
     DebtToken,
     NextVaultId,
+    /// Debt-token units set aside to absorb bad debt.
+    ReserveDebt,
+    /// Collateral-token units absorbed from bad-debt liquidations.
+    ReserveCollateral,
 }
 
 #[contract]
@@ -58,6 +62,10 @@ impl LiquidationEngine {
             .instance()
             .set(&DataKey::DebtToken, &debt_token);
         env.storage().instance().set(&DataKey::NextVaultId, &1u32);
+        env.storage().instance().set(&DataKey::ReserveDebt, &0_i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::ReserveCollateral, &0_i128);
     }
 
     pub fn create_vault(env: Env, owner: Address, collateral: u128, debt: u128) -> u32 {
@@ -95,6 +103,28 @@ impl LiquidationEngine {
             return i128::MAX;
         }
 
+        let (collateral_value_usd, debt_value_usd) = Self::vault_values(&env, vault_id);
+
+        if debt_value_usd == 0 {
+            return i128::MAX;
+        }
+
+        collateral_value_usd
+            .checked_mul(HF_DECIMALS)
+            .expect("health factor overflow")
+            / debt_value_usd
+    }
+
+    /// Oracle value of a vault's collateral and of its debt, in the oracle's base
+    /// units. Both sides go through the oracle, so comparing them is a real value
+    /// comparison rather than a raw token-count one.
+    fn vault_values(env: &Env, vault_id: u32) -> (i128, i128) {
+        let vault: Vault = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Vaults(vault_id))
+            .expect("vault not found");
+
         let oracle_id: Address = env.storage().instance().get(&DataKey::OracleId).unwrap();
         let collateral_token: Address = env
             .storage()
@@ -106,29 +136,22 @@ impl LiquidationEngine {
         let collateral_price: i128 = env.invoke_contract(
             &oracle_id,
             &symbol_short!("get_price"),
-            soroban_sdk::vec![&env, collateral_token.into_val(&env)],
+            soroban_sdk::vec![env, collateral_token.into_val(env)],
         );
         let debt_price: i128 = env.invoke_contract(
             &oracle_id,
             &symbol_short!("get_price"),
-            soroban_sdk::vec![&env, debt_token.into_val(&env)],
+            soroban_sdk::vec![env, debt_token.into_val(env)],
         );
 
-        let collateral_value_usd: i128 = (vault.collateral_amount as i128)
+        let collateral_value = (vault.collateral_amount as i128)
             .checked_mul(collateral_price)
             .expect("collateral value overflow");
-        let debt_value_usd: i128 = (vault.debt_amount as i128)
+        let debt_value = (vault.debt_amount as i128)
             .checked_mul(debt_price)
             .expect("debt value overflow");
 
-        if debt_value_usd == 0 {
-            return i128::MAX;
-        }
-
-        collateral_value_usd
-            .checked_mul(HF_DECIMALS)
-            .expect("health factor overflow")
-            / debt_value_usd
+        (collateral_value, debt_value)
     }
 
     /// Returns true when a vault is undercollateralised, i.e. its health
@@ -236,12 +259,117 @@ impl LiquidationEngine {
             (liquidate_amount, collateral_to_liquidate, incentive),
         );
     }
+
+    /// Adds `amount` debt-token units to the reserve pool, returning the new
+    /// reserve balance.
+    ///
+    /// Permissionless by design: the reserve exists to absorb bad debt for the
+    /// protocol's benefit, so anyone may recapitalise it. The caller authorises
+    /// their own contribution, which keeps the accounting honest about who
+    /// provided the backstop.
+    pub fn fund_reserve(env: Env, from: Address, amount: i128) -> i128 {
+        from.require_auth();
+        assert!(amount > 0, "reserve funding must be positive");
+
+        let reserve = Self::reserve_debt(env.clone())
+            .checked_add(amount)
+            .expect("reserve overflow");
+        env.storage()
+            .instance()
+            .set(&DataKey::ReserveDebt, &reserve);
+        reserve
+    }
+
+    /// Debt-token units the reserve can still spend clearing bad debt.
+    pub fn reserve_debt(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ReserveDebt)
+            .unwrap_or(0)
+    }
+
+    /// Collateral-token units the reserve has absorbed from bad-debt vaults.
+    pub fn reserve_collateral(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ReserveCollateral)
+            .unwrap_or(0)
+    }
+
+    /// Clears a vault whose collateral is worth less than its debt.
+    ///
+    /// This is the backstop for vaults that `liquidate` and `partial_liquidate`
+    /// cannot help: there is no profitable collateral left to seize, so the
+    /// position would otherwise sit on the books as bad debt indefinitely. The
+    /// reserve pays the debt in full and takes the remaining collateral, so the
+    /// vault ends closed at zero exactly as a full liquidation leaves it.
+    ///
+    /// Permissionless on purpose. The caller is not paid and gains nothing, so
+    /// requiring authorisation would only add friction to a piece of protocol
+    /// maintenance that everyone benefits from.
+    pub fn liquidate_bad_debt(env: Env, vault_id: u32) {
+        let mut vault: Vault = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Vaults(vault_id))
+            .expect("vault not found");
+
+        let (collateral_value, debt_value) = Self::vault_values(&env, vault_id);
+
+        // Bad debt means the collateral is worth strictly less than the debt. A
+        // vault at or above 1.0 is still profitable to liquidate normally, and a
+        // vault with no debt has nothing to clear.
+        assert!(
+            collateral_value < debt_value,
+            "vault is not under-collateralized"
+        );
+
+        // The reserve covers the whole debt because the liquidator is not paid
+        // here; every remaining collateral unit goes to the reserve instead.
+        let debt_cleared = vault.debt_amount as i128;
+        let collateral_absorbed = vault.collateral_amount as i128;
+        // Value the reserve is actually out of pocket, in oracle base units.
+        let shortfall = debt_value - collateral_value;
+
+        let reserve = Self::reserve_debt(env.clone());
+        assert!(
+            reserve >= debt_cleared,
+            "reserve pool cannot cover bad debt"
+        );
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ReserveDebt, &(reserve - debt_cleared));
+        env.storage().instance().set(
+            &DataKey::ReserveCollateral,
+            &Self::reserve_collateral(env.clone())
+                .checked_add(collateral_absorbed)
+                .expect("reserve overflow"),
+        );
+
+        // Close the vault: the debt is written off against the reserve and the
+        // leftover collateral has changed hands, so nothing is left to liquidate.
+        // The record is zeroed rather than deleted, matching `liquidate`, so a
+        // cleared vault stays queryable for accounting and audit.
+        vault.debt_amount = 0;
+        vault.collateral_amount = 0;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Vaults(vault_id), &vault);
+
+        // `shortfall` is reported in oracle value units, which is what a reserve
+        // operator needs in order to size future funding.
+        env.events().publish(
+            (symbol_short!("baddebt"),),
+            (vault_id, debt_cleared, collateral_absorbed, shortfall),
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::{testutils::Address as _, testutils::Events, vec as svec};
 
     #[contracttype]
     enum MockDataKey {
@@ -511,5 +639,196 @@ mod tests {
         // 2 * $1 = $2 collateral, 1 * $1 = $1 debt → HF = 20000 (> 15000) → not eligible
         let vid = client.create_vault(&user, &2u128, &1u128);
         client.partial_liquidate(&liquidator, &vid, &1u128);
+    }
+
+    // ── Bad debt backstop ─────────────────────────────────────────────────────
+
+    /// Reads a vault's balances straight from storage: the contract exposes no
+    /// public getter for them, and these tests assert on the raw amounts.
+    fn vault_of(env: &Env, client: &LiquidationEngineClient<'static>, vault_id: u32) -> Vault {
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::Vaults(vault_id))
+                .expect("vault not found")
+        })
+    }
+
+    #[test]
+    fn test_fund_reserve_accumulates() {
+        let (_env, client, _oracle_id, _ct, _dt) = setup();
+        let funder = Address::generate(&_env);
+
+        assert_eq!(client.reserve_debt(), 0);
+        assert_eq!(client.fund_reserve(&funder, &100), 100);
+        // A second, smaller top-up adds to the balance rather than replacing it.
+        assert_eq!(client.fund_reserve(&funder, &50), 150);
+        assert_eq!(client.reserve_debt(), 150);
+    }
+
+    #[test]
+    #[should_panic(expected = "reserve funding must be positive")]
+    fn test_fund_reserve_rejects_zero() {
+        let (_env, client, _oracle_id, _ct, _dt) = setup();
+        let funder = Address::generate(&_env);
+        client.fund_reserve(&funder, &0);
+    }
+
+    #[test]
+    fn test_liquidate_bad_debt_clears_vault_from_reserve() {
+        let (_env, client, _oracle_id, _ct, _dt) = setup();
+        let user = Address::generate(&_env);
+        let funder = Address::generate(&_env);
+
+        // 1 * $1 collateral against 2 * $1 debt → HF = 5000, genuinely bad debt.
+        let vid = client.create_vault(&user, &1u128, &2u128);
+        client.fund_reserve(&funder, &200);
+
+        client.liquidate_bad_debt(&vid);
+
+        // The vault is closed: no debt left to liquidate, no collateral left to seize.
+        let vault = vault_of(&_env, &client, vid);
+        assert_eq!(vault.debt_amount, 0);
+        assert_eq!(vault.collateral_amount, 0);
+        assert_eq!(client.get_health_factor(&vid), i128::MAX);
+
+        // The reserve paid the 2 debt-token units and took the 1 collateral unit.
+        assert_eq!(client.reserve_debt(), 198);
+        assert_eq!(client.reserve_collateral(), 1);
+    }
+
+    #[test]
+    fn test_liquidate_bad_debt_is_driven_by_the_oracle() {
+        let (_env, client, oracle_id, ct, _dt) = setup();
+        let oracle = MockOracleConsumerClient::new(&_env, &oracle_id);
+        let user = Address::generate(&_env);
+        let funder = Address::generate(&_env);
+
+        // At equal prices 2 collateral against 2 debt is exactly at par, so there
+        // is no bad debt to clear.
+        let vid = client.create_vault(&user, &2u128, &2u128);
+        assert_eq!(client.get_health_factor(&vid), 10_000);
+
+        // A price move is what turns it into bad debt: collateral halves while
+        // the debt is unchanged.
+        oracle.set_price(&ct, &50_000_000);
+        assert_eq!(client.get_health_factor(&vid), 5_000);
+
+        client.fund_reserve(&funder, &200);
+        client.liquidate_bad_debt(&vid);
+
+        assert_eq!(client.reserve_debt(), 198);
+        assert_eq!(client.reserve_collateral(), 2);
+    }
+
+    #[test]
+    fn test_reserve_absorbs_collateral_from_several_vaults() {
+        let (_env, client, _oracle_id, _ct, _dt) = setup();
+        let user = Address::generate(&_env);
+        let funder = Address::generate(&_env);
+
+        let first = client.create_vault(&user, &1u128, &2u128);
+        let second = client.create_vault(&user, &3u128, &4u128);
+        client.fund_reserve(&funder, &100);
+
+        client.liquidate_bad_debt(&first);
+        client.liquidate_bad_debt(&second);
+
+        // 100 - 2 - 4 debt units spent, 1 + 3 collateral units absorbed.
+        assert_eq!(client.reserve_debt(), 94);
+        assert_eq!(client.reserve_collateral(), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "reserve pool cannot cover bad debt")]
+    fn test_liquidate_bad_debt_requires_a_funded_reserve() {
+        let (_env, client, _oracle_id, _ct, _dt) = setup();
+        let user = Address::generate(&_env);
+        let funder = Address::generate(&_env);
+
+        // The reserve cannot even cover the first unit of a 2-unit debt.
+        client.fund_reserve(&funder, &1);
+        let vid = client.create_vault(&user, &1u128, &2u128);
+        client.liquidate_bad_debt(&vid);
+    }
+
+    #[test]
+    #[should_panic(expected = "vault is not under-collateralized")]
+    fn test_liquidate_bad_debt_rejects_vault_at_par() {
+        let (_env, client, _oracle_id, _ct, _dt) = setup();
+        let user = Address::generate(&_env);
+        let funder = Address::generate(&_env);
+
+        // HF exactly 1.0 is not bad debt: it can be liquidated at a profit.
+        let vid = client.create_vault(&user, &2u128, &2u128);
+        client.fund_reserve(&funder, &200);
+        client.liquidate_bad_debt(&vid);
+    }
+
+    #[test]
+    #[should_panic(expected = "vault is not under-collateralized")]
+    fn test_liquidate_bad_debt_rejects_healthy_vault() {
+        let (_env, client, _oracle_id, _ct, _dt) = setup();
+        let user = Address::generate(&_env);
+        let funder = Address::generate(&_env);
+
+        let vid = client.create_vault(&user, &5u128, &1u128);
+        client.fund_reserve(&funder, &200);
+        client.liquidate_bad_debt(&vid);
+    }
+
+    #[test]
+    #[should_panic(expected = "vault is not under-collateralized")]
+    fn test_liquidate_bad_debt_rejects_vault_without_debt() {
+        let (_env, client, _oracle_id, _ct, _dt) = setup();
+        let user = Address::generate(&_env);
+        let funder = Address::generate(&_env);
+
+        // Nothing to clear, so the reserve must stay untouched.
+        let vid = client.create_vault(&user, &5u128, &0u128);
+        client.fund_reserve(&funder, &200);
+        client.liquidate_bad_debt(&vid);
+    }
+
+    #[test]
+    fn test_liquidate_bad_debt_is_permissionless() {
+        let (_env, client, _oracle_id, _ct, _dt) = setup();
+        let user = Address::generate(&_env);
+        let funder = Address::generate(&_env);
+
+        // `env.mock_all_auths()` is on and the vault owner is not consulted:
+        // clearing bad debt needs no authorisation from anyone.
+        let vid = client.create_vault(&user, &1u128, &2u128);
+        client.fund_reserve(&funder, &200);
+        client.liquidate_bad_debt(&vid);
+
+        assert_eq!(client.reserve_debt(), 198);
+    }
+
+    #[test]
+    fn test_liquidate_bad_debt_reports_the_shortfall() {
+        let (_env, client, _oracle_id, _ct, _dt) = setup();
+        let user = Address::generate(&_env);
+        let funder = Address::generate(&_env);
+
+        // 1 collateral ($1) against 2 debt ($2) at 1e8 base units: the reserve is
+        // out of pocket $1, which is the number a reserve operator sizes against.
+        let vid = client.create_vault(&user, &1u128, &2u128);
+        client.fund_reserve(&funder, &200);
+        client.liquidate_bad_debt(&vid);
+
+        // `all()` reports the most recent invocation, i.e. the bad-debt call.
+        // Topics: (baddebt); data: (vault_id, debt_cleared, collateral, shortfall).
+        assert_eq!(
+            _env.events().all(),
+            svec![
+                &_env,
+                (
+                    client.address.clone(),
+                    svec![&_env, symbol_short!("baddebt").into_val(&_env)],
+                    (vid, 2i128, 1i128, 100_000_000i128).into_val(&_env),
+                ),
+            ]
+        );
     }
 }
