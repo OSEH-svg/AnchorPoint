@@ -28,6 +28,8 @@ enum DataKey {
     FeeBps,
     /// Security registry address
     SecurityRegistry,
+    /// Reentrancy lock flag guarding borrower callback execution
+    ReentrancyLock,
 }
 
 /// Loan details for batch operations
@@ -89,6 +91,24 @@ impl FlashLoanProvider {
         env.storage().instance().get(&DataKey::FeeBps).unwrap_or(5)
     }
 
+    /// Acquire the reentrancy lock, trapping if a flash loan is already in progress.
+    ///
+    /// The lock is held across the untrusted borrower callback and only released
+    /// after the post-callback repayment verification completes, so a malicious
+    /// receiver cannot recursively re-enter `flash_loan`/`flash_loan_batch` and
+    /// drain the pool.
+    fn acquire_reentrancy_lock(env: &Env) {
+        if env.storage().instance().has(&DataKey::ReentrancyLock) {
+            panic!("Reentrancy detected: flash loan already in progress");
+        }
+        env.storage().instance().set(&DataKey::ReentrancyLock, &true);
+    }
+
+    /// Release the reentrancy lock once balance verification has completed.
+    fn release_reentrancy_lock(env: &Env) {
+        env.storage().instance().remove(&DataKey::ReentrancyLock);
+    }
+
     /// Executes a flash loan for a single asset.
     ///
     /// # Arguments
@@ -96,6 +116,9 @@ impl FlashLoanProvider {
     /// * `token` - The address of the token to be lent.
     /// * `amount` - The amount of tokens to lend.
     pub fn flash_loan(env: Env, receiver: Address, token: Address, amount: i128) {
+        // 0. Acquire the reentrancy lock before any external interaction.
+        Self::acquire_reentrancy_lock(&env);
+
         // 1. Calculate the fee (e.g. default 5 bps = 0.05%, or configured fee_bps such as 9 bps = 0.09%)
         let fee_bps = Self::get_fee_bps(env.clone());
         let fee = calculate_fee(amount, fee_bps);
@@ -110,7 +133,7 @@ impl FlashLoanProvider {
         // 4. Transfer tokens to the receiver
         token_client.transfer(&env.current_contract_address(), &receiver, &amount);
 
-        // 5. Invoke the receiver's execution logic
+        // 5. Invoke the receiver's execution logic (untrusted external call, lock held)
         let receiver_client = FlashLoanReceiverClient::new(&env, &receiver);
         receiver_client.execute_loan(&token, &amount, &fee);
 
@@ -119,6 +142,9 @@ impl FlashLoanProvider {
         if balance_after < required_repayment {
             panic!("Flash loan not repaid with fee");
         }
+
+        // 7. Release the lock only after balance verification has completed.
+        Self::release_reentrancy_lock(&env);
 
         // Topic: event name only; receiver + token (Addresses) + amounts in data.
         env.events()
@@ -146,6 +172,9 @@ impl FlashLoanProvider {
         if loans.is_empty() {
             panic!("cannot flash loan zero assets");
         }
+
+        // 0. Acquire the reentrancy lock before any external interaction.
+        Self::acquire_reentrancy_lock(&env);
 
         let fee_bps = Self::get_fee_bps(env.clone());
         let provider_address = env.current_contract_address();
@@ -180,7 +209,7 @@ impl FlashLoanProvider {
             token_client.transfer(&provider_address, &receiver, &amount);
         }
 
-        // 3. Invoke the receiver's batch execution logic
+        // 3. Invoke the receiver's batch execution logic (untrusted external call, lock held)
         let receiver_client = FlashLoanBatchReceiverClient::new(&env, &receiver);
         receiver_client.execute_batch_loan(&loan_details);
 
@@ -198,7 +227,10 @@ impl FlashLoanProvider {
             }
         }
 
-        // 5. Emit batch event
+        // 5. Release the lock only after balance verification has completed.
+        Self::release_reentrancy_lock(&env);
+
+        // 6. Emit batch event
         env.events()
             .publish((symbol_short!("fl_batch"), receiver), loan_details);
     }
