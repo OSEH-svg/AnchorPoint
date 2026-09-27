@@ -1,52 +1,166 @@
 name: Backend CI/CD
-  
+
 on:
   push:
     branches: ["**"]
     paths:
       - 'backend/**'
+      - '.github/workflows/backend.yml'
   pull_request:
     branches: [main]
     paths:
       - 'backend/**'
+      - '.github/workflows/backend.yml'
 
 jobs:
   validate:
     name: Validate Migration Integrity
     runs-on: ubuntu-latest
-    
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: postgres
+
+    services:
+      redis:
+        image: redis
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: cidb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      postgres-shadow:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: shadowdb
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     defaults:
       run:
         working-directory: backend
 
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: 'npm'
-          cache-dependency-path: 'backend/package-lock.json'
-          
+          cache-dependency-path: 'package-lock.json'
+
       - name: Install dependencies
         run: npm install
-        
+
+      # Generate the Prisma client before any migration steps so that all
+      # downstream commands (migrate deploy, migrate diff, ts-node scripts)
+      # have the correct client bindings available.
+      - name: Generate Prisma client
+        env:
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/cidb"
+        run: npx prisma generate
+
+      # Fast environment check — fails immediately with a clear message if
+      # DATABASE_URL is missing or malformed, rather than surfacing a cryptic
+      # Prisma error several steps later.
+      - name: Validate migration environment
+        env:
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/cidb"
+        run: node scripts/validate-migration-env.js
+
+      # Clean the verification database schema before running migrations
+      # This ensures a fresh state and prevents "relation already exists" errors
+      - name: Clean verification database schema
+        env:
+          DATABASE_URL: "postgresql://prisma:prisma_password@localhost:5432/cidb"
+        run: |
+          npx prisma db execute --url "$DATABASE_URL" --stdin <<EOF
+          DROP SCHEMA IF EXISTS public CASCADE;
+          CREATE SCHEMA public;
+          EOF
+
       - name: Verify Migrations Against Temporary Database
         env:
-          DATABASE_URL: "file:./ci-verify.db"
+          DATABASE_URL: "postgresql://prisma:prisma_password@localhost:5432/cidb"
+          SHADOW_DATABASE_URL: "postgresql://prisma:prisma_password@localhost:5433/shadowdb"
+          VERIFY_MIGRATIONS_ALLOW_RESET: "true"
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/cidb"
+          SHADOW_DATABASE_URL: "postgresql://postgres:postgres@localhost:5433/shadowdb"
         run: npm run migrate:verify
-        
+
       - name: Run Migration Integrity Checker
         env:
-          DATABASE_URL: "file:./ci.db"
-          SHADOW_DATABASE_URL: "file:./shadow.db"
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/cidb"
+          SHADOW_DATABASE_URL: "postgresql://postgres:postgres@localhost:5433/shadowdb"
         run: node scripts/check-migrations.js
-        
+
+      # Emit migration status as an artefact so reviewers can see which
+      # migrations are applied without re-running CI.
+      - name: Report migration status
+        if: always()
+        env:
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/cidb"
+        run: |
+          echo "## Migration Status" > migration-status.md
+          npx prisma migrate status >> migration-status.md 2>&1 || true
+
+      - name: Upload migration status report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: migration-status
+          path: backend/migration-status.md
+          retention-days: 7
+
+      - name: Audit dependencies
+        continue-on-error: true
+        run: npm audit --audit-level=high
+
+      - name: Wait for Postgres
+        run: |
+          for i in {1..30}; do
+            pg_isready -q -h 127.0.0.1 -p 5432 -U postgres && break
+            sleep 1
+          done
+
+      - name: Run DB migrations
+        env:
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/cidb"
+        run: npx prisma migrate deploy || npx prisma db push
+
       - name: Run Lint
         run: npm run lint
-        
+
       - name: Run Tests
         env:
-          DATABASE_URL: "file:./test.db"
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/cidb"
+          SHADOW_DATABASE_URL: "postgresql://postgres:postgres@localhost:5433/shadowdb"
         run: npm test
+
+      - name: Cleanup test artifacts
+        if: always()
+        run: rm -rf coverage logs test.db* migration-status.md

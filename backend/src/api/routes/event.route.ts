@@ -1,5 +1,7 @@
 import { Router } from 'express';
 import { eventController } from '../controllers/event.controller';
+import { webhookSignatureMiddleware } from '../middleware/auth.middleware';
+import logger from '../../utils/logger';
 
 const router = Router();
 
@@ -77,5 +79,15 @@ router.get('/', eventController.getEvents);
  *         description: Server error
  */
 router.get('/health', eventController.getHealth);
+
+router.post('/webhook', webhookSignatureMiddleware, async (req, res) => {
+  try {
+    logger.info('Received webhook callback', { body: req.body });
+    res.status(200).json({ received: true });
+  } catch (error) {
+    logger.error('Webhook processing failed', { error: error instanceof Error ? error.message : 'Unknown error' });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 export default router;

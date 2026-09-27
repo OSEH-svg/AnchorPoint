@@ -1,9 +1,14 @@
-import { Horizon } from '@stellar/stellar-sdk';
 import { stellarService } from './stellar.service';
 import { metricsService } from './metrics.service';
 import { redis } from '../lib/redis';
+import { smtpService } from '../lib/smtp.service';
+import prisma from '../lib/prisma';
+import type { AlertPayload } from '../types/alerts';
 import logger from '../utils/logger';
 import promClient, { Gauge } from 'prom-client';
+import { type AlertEmailService, SmtpAlertEmailService } from './alert-email.service';
+
+export type { AlertPayload } from '../types/alerts';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -27,15 +32,6 @@ export interface WalletBalanceSnapshot {
   checkedAt: string;
 }
 
-export interface AlertPayload {
-  walletLabel: string;
-  publicKey: string;
-  assetCode: string;
-  currentBalance: number;
-  thresholdAmount: number;
-  checkedAt: string;
-}
-
 export interface AlertChannelConfig {
   /** Slack incoming-webhook URL */
   slackWebhookUrl?: string;
@@ -54,6 +50,8 @@ export interface HotWalletMonitorConfig {
   alertChannels?: AlertChannelConfig;
   /** Redis key TTL for de-duplication, in seconds (default: 3600) */
   alertCooldownSeconds?: number;
+  /** SMTP-backed alert email delivery */
+  alertEmailService?: AlertEmailService;
 }
 
 // ─── Prometheus gauges ────────────────────────────────────────────────────────
@@ -72,12 +70,19 @@ const walletBelowThresholdGauge = new Gauge({
   registers: [metricsService.getRegistry()],
 });
 
+const slaBreachTransactionsGauge = new Gauge({
+  name: 'sla_breach_transactions_count',
+  help: 'Number of transactions stuck in PENDING_EXTERNAL for over 2 hours',
+  registers: [metricsService.getRegistry()],
+});
+
 // ─── Service ──────────────────────────────────────────────────────────────────
 
 export class HotWalletMonitorService {
   private static instance: HotWalletMonitorService;
 
   private config: HotWalletMonitorConfig;
+  private readonly alertEmailService: AlertEmailService;
   private timer: ReturnType<typeof setInterval> | null = null;
   private readonly COOLDOWN_KEY_PREFIX = 'hot_wallet_alert:';
 
@@ -90,8 +95,10 @@ export class HotWalletMonitorService {
         emailRecipients: process.env.ALERT_EMAIL_RECIPIENTS,
         customWebhookUrl: process.env.ALERT_WEBHOOK_URL,
       },
+      alertEmailService: config.alertEmailService ?? new SmtpAlertEmailService(),
       ...config,
     };
+    this.alertEmailService = this.config.alertEmailService!;
   }
 
   public static getInstance(config?: HotWalletMonitorConfig): HotWalletMonitorService {
@@ -148,6 +155,8 @@ export class HotWalletMonitorService {
       logger.info('[HotWalletMonitor] All wallets above threshold');
     }
 
+    await this.checkSlaBreaches();
+
     return snapshots;
   }
 
@@ -196,6 +205,131 @@ export class HotWalletMonitorService {
         checkedAt,
       };
     }
+  }
+
+/** Check for transactions stuck in PENDING_EXTERNAL for over 2 hours and alert ops. */
+  private async checkSlaBreaches(): Promise<void> {
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+
+    let pendingTransactions;
+    try {
+      pendingTransactions = await prisma.transaction.findMany({
+        where: {
+          status: 'PENDING_EXTERNAL',
+          createdAt: { lt: twoHoursAgo },
+        },
+        select: {
+          id: true,
+          userId: true,
+          assetCode: true,
+          amount: true,
+          type: true,
+          createdAt: true,
+        },
+      });
+    } catch (error) {
+      logger.error('[HotWalletMonitor] Failed to query SLA breach transactions', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
+
+    slaBreachTransactionsGauge.set(pendingTransactions.length);
+
+    if (pendingTransactions.length > 0) {
+      logger.warn('[HotWalletMonitor] SLA breach detected — pending transactions stuck over 2 hours', {
+        count: pendingTransactions.length,
+        transactionIds: pendingTransactions.map((tx: { id: string }) => tx.id),
+      });
+
+      await this.handleSlaBreachAlert(pendingTransactions);
+    }
+  }
+
+  private async handleSlaBreachAlert(transactions: Array<{ id: string; userId: string; assetCode: string; amount: string; type: string; createdAt: Date }>): Promise<void> {
+    const payload: AlertPayload = {
+      walletLabel: 'SLA Breach Monitor',
+      publicKey: '',
+      assetCode: 'MULTI',
+      currentBalance: 0,
+      thresholdAmount: 0,
+      checkedAt: new Date().toISOString(),
+    };
+
+    logger.error('[HotWalletMonitor] SLA BREACH ALERT', { alert: payload, transactionCount: transactions.length });
+
+    const channels = this.config.alertChannels ?? {};
+    await Promise.allSettled([
+      channels.slackWebhookUrl
+        ? this.sendSlaSlackAlert(channels.slackWebhookUrl, transactions, payload)
+        : Promise.resolve(),
+      channels.emailRecipients
+        ? this.sendSlaEmailAlert(channels.emailRecipients, transactions, payload)
+        : Promise.resolve(),
+      channels.customWebhookUrl
+        ? this.sendCustomWebhook(channels.customWebhookUrl, payload)
+        : Promise.resolve(),
+    ]);
+  }
+
+  private async sendSlaSlackAlert(webhookUrl: string, transactions: Array<{ id: string; userId: string; assetCode: string; amount: string; type: string; createdAt: Date }>, alert: AlertPayload): Promise<void> {
+    const transactionList = transactions
+      .map((tx) => `• ${tx.id} — ${tx.type} ${tx.amount} ${tx.assetCode} (pending since ${tx.createdAt.toISOString()})`)
+      .join('\n');
+
+    const message = {
+      text: '🚨 *SLA Breach Alert — Stuck Pending Transactions*',
+      attachments: [
+        {
+          color: 'warning',
+          fields: [
+            { title: 'Stuck Transactions', value: transactionList, short: false },
+            { title: 'Count', value: String(transactions.length), short: true },
+            { title: 'Threshold', value: '2 hours', short: true },
+            { title: 'Detected At', value: alert.checkedAt, short: false },
+          ],
+        },
+      ],
+    };
+
+    const response = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(message),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Slack responded ${response.status}`);
+    }
+
+    logger.info('[HotWalletMonitor] SLA breach Slack alert sent', { count: transactions.length });
+  }
+
+  private async sendSlaEmailAlert(recipients: string, transactions: Array<{ id: string; userId: string; assetCode: string; amount: string; type: string; createdAt: Date }>, alert: AlertPayload): Promise<void> {
+    const transactionList = transactions
+      .map((tx) => `  - ${tx.id}: ${tx.type} ${tx.amount} ${tx.assetCode} (pending since ${tx.createdAt.toISOString()})`)
+      .join('\n');
+
+    const text = [
+      'SLA Breach Alert — Stuck Pending Transactions',
+      `Count: ${transactions.length}`,
+      `Threshold: 2 hours in PENDING_EXTERNAL state`,
+      'Affected transactions:',
+      transactionList,
+      `Detected At: ${alert.checkedAt}`,
+    ].join('\n');
+
+    const sent = await smtpService.sendMail({
+      to: recipients.split(',').map((recipient) => recipient.trim()).filter(Boolean),
+      subject: '[AnchorPoint] SLA Breach: Stuck Pending Transactions',
+      text,
+    });
+
+    if (sent) {
+      logger.info('[HotWalletMonitor] SLA breach email alert sent', { recipients });
+    }
+    await this.alertEmailService.sendHotWalletLowBalanceAlert(recipients, alert);
+    logger.info('[HotWalletMonitor] SLA breach email alert dispatched', { recipients });
   }
 
   // ── Balance fetching ────────────────────────────────────────────────────────
@@ -302,20 +436,27 @@ export class HotWalletMonitorService {
   }
 
   private async sendEmailAlert(recipients: string, alert: AlertPayload): Promise<void> {
-    // This project has no email transport wired up yet.
-    // Log the intent so an operator / future SMTP integration can act on it.
-    logger.warn('[HotWalletMonitor] Email alert (no transport configured — log only)', {
-      recipients,
-      alert,
+    const text = [
+      'Hot Wallet Low Balance Alert',
+      `Wallet: ${alert.walletLabel}`,
+      `Asset: ${alert.assetCode}`,
+      `Current Balance: ${alert.currentBalance}`,
+      `Threshold: ${alert.thresholdAmount}`,
+      `Public Key: ${alert.publicKey}`,
+      `Detected At: ${alert.checkedAt}`,
+    ].join('\n');
+
+    const sent = await smtpService.sendMail({
+      to: recipients.split(',').map((recipient) => recipient.trim()).filter(Boolean),
+      subject: `[AnchorPoint] Low Balance: ${alert.walletLabel}`,
+      text,
     });
 
-    // TODO: wire up nodemailer / SendGrid / SES here when an SMTP service is added.
-    // Example:
-    //   await mailer.sendMail({
-    //     to: recipients,
-    //     subject: `[AnchorPoint] Low Balance: ${alert.walletLabel}`,
-    //     text: formatEmailBody(alert),
-    //   });
+    if (sent) {
+      logger.info('[HotWalletMonitor] Email alert sent', { wallet: alert.walletLabel, recipients });
+    }
+    await this.alertEmailService.sendHotWalletLowBalanceAlert(recipients, alert);
+    logger.info('[HotWalletMonitor] Email alert dispatched', { wallet: alert.walletLabel });
   }
 
   private async sendCustomWebhook(url: string, alert: AlertPayload): Promise<void> {

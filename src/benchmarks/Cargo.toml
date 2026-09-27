@@ -4,8 +4,9 @@ version = "0.0.0"
 edition = "2021"
 
 [dependencies]
-soroban-sdk = "22.0.0"
+soroban-sdk = "26.0.1"
 
 [dev-dependencies]
 anchorpoint-amm = { path = "../../src/amm" }
 sep41-token = { path = "../../src/token" }
+staking = { path = "../../src/staking" }

@@ -98,6 +98,55 @@ describe('FeatureFlagService', () => {
       const result2 = await service.isEnabled('test.targeted', { userId: 'user3' });
       expect(result2).toBe(false);
     });
+
+    it('should prioritize whitelisted user IDs over rollout percentage', async () => {
+      const flagWithWhitelist: FeatureFlag = {
+        name: 'test.whitelisted',
+        enabled: true,
+        description: 'Whitelisted flag',
+        rolloutPercentage: 0,
+        whitelistedUserIds: ['whitelisted-user'],
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      await service.setFlag('test.whitelisted', flagWithWhitelist);
+
+      // Should be enabled for whitelisted user even with 0% rollout
+      const result1 = await service.isEnabled('test.whitelisted', { userId: 'whitelisted-user' });
+      expect(result1).toBe(true);
+
+      // Should be disabled for non-whitelisted user when rollout is 0%
+      const result2 = await service.isEnabled('test.whitelisted', { userId: 'other-user' });
+      expect(result2).toBe(false);
+    });
+
+    it('should enable whitelisted user even when target users do not include them', async () => {
+      const flagWithWhitelist: FeatureFlag = {
+        name: 'test.whitelist-override',
+        enabled: true,
+        description: 'Whitelist override flag',
+        rolloutPercentage: 100,
+        targetUsers: ['user1'],
+        whitelistedUserIds: ['whitelisted-user'],
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      await service.setFlag('test.whitelist-override', flagWithWhitelist);
+
+      // Whitelisted user should be enabled even if not in targetUsers
+      const result1 = await service.isEnabled('test.whitelist-override', { userId: 'whitelisted-user' });
+      expect(result1).toBe(true);
+
+      // Target user should also be enabled
+      const result2 = await service.isEnabled('test.whitelist-override', { userId: 'user1' });
+      expect(result2).toBe(true);
+
+      // Non-target, non-whitelisted user should be disabled by rollout
+      const result3 = await service.isEnabled('test.whitelist-override', { userId: 'user2' });
+      expect(result3).toBe(false);
+    });
   });
 
   describe('getFlag', () => {

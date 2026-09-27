@@ -24,7 +24,7 @@ members = [
     "src/vesting",
     "src/proxy",
     "src/yield_farming",
-    "src/benchmarks"
+    "src/benchmarks",
 ]
 resolver = "2"
 
@@ -36,4 +36,5 @@ strip = true
 debug-assertions = false
 panic = "abort"
 codegen-units = 1
-lto = "fat"
+lto = true
+

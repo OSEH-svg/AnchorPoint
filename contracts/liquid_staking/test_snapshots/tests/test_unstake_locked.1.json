@@ -631,6 +631,43 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "ContractMeta"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "map": [
+                            {
+                              "key": {
+                                "symbol": "description"
+                              },
+                              "val": {
+                                "string": ""
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "icon_url"
+                              },
+                              "val": {
+                                "string": ""
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "website"
+                              },
+                              "val": {
+                                "string": ""
+                              }
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "NftMetadata"
                             },
                             {
@@ -653,7 +690,116 @@
                                 "symbol": "attributes"
                               },
                               "val": {
-                                "vec": []
+                                "vec": [
+                                  {
+                                    "map": [
+                                      {
+                                        "key": {
+                                          "symbol": "display_type"
+                                        },
+                                        "val": {
+                                          "string": "number"
+                                        }
+                                      },
+                                      {
+                                        "key": {
+                                          "symbol": "max_value"
+                                        },
+                                        "val": {
+                                          "string": ""
+                                        }
+                                      },
+                                      {
+                                        "key": {
+                                          "symbol": "trait_type"
+                                        },
+                                        "val": {
+                                          "string": "Stake Amount"
+                                        }
+                                      },
+                                      {
+                                        "key": {
+                                          "symbol": "value"
+                                        },
+                                        "val": {
+                                          "string": "500000"
+                                        }
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "map": [
+                                      {
+                                        "key": {
+                                          "symbol": "display_type"
+                                        },
+                                        "val": {
+                                          "string": "date"
+                                        }
+                                      },
+                                      {
+                                        "key": {
+                                          "symbol": "max_value"
+                                        },
+                                        "val": {
+                                          "string": ""
+                                        }
+                                      },
+                                      {
+                                        "key": {
+                                          "symbol": "trait_type"
+                                        },
+                                        "val": {
+                                          "string": "Lock Expiration"
+                                        }
+                                      },
+                                      {
+                                        "key": {
+                                          "symbol": "value"
+                                        },
+                                        "val": {
+                                          "string": "3600"
+                                        }
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "map": [
+                                      {
+                                        "key": {
+                                          "symbol": "display_type"
+                                        },
+                                        "val": {
+                                          "string": "number"
+                                        }
+                                      },
+                                      {
+                                        "key": {
+                                          "symbol": "max_value"
+                                        },
+                                        "val": {
+                                          "string": ""
+                                        }
+                                      },
+                                      {
+                                        "key": {
+                                          "symbol": "trait_type"
+                                        },
+                                        "val": {
+                                          "string": "Accrued Rewards"
+                                        }
+                                      },
+                                      {
+                                        "key": {
+                                          "symbol": "value"
+                                        },
+                                        "val": {
+                                          "string": "0"
+                                        }
+                                      }
+                                    ]
+                                  }
+                                ]
                               }
                             },
                             {
@@ -702,6 +848,14 @@
                               },
                               "val": {
                                 "bool": true
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "metadata_uri"
+                              },
+                              "val": {
+                                "string": ""
                               }
                             },
                             {
@@ -1012,12 +1166,61 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "ContractMeta"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "map": [
+                            {
+                              "key": {
+                                "symbol": "description"
+                              },
+                              "val": {
+                                "string": ""
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "icon_url"
+                              },
+                              "val": {
+                                "string": ""
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "website"
+                              },
+                              "val": {
+                                "string": ""
+                              }
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "NftContract"
                             }
                           ]
                         },
                         "val": {
                           "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "Paused"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "bool": false
                         }
                       },
                       {

@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
  * Prisma Migration Verification Script
- * 
+ *
  * Verifies the integrity of Prisma migrations against a temporary database
  * to prevent breaking changes during production deployments.
- * 
+ *
  * This script:
  * 1. Creates a temporary database
  * 2. Applies all migrations to it
@@ -16,7 +16,18 @@
 import { execSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
+import * as crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+
+// Ensure default sqlite path when running in CI/testing
+if (!process.env.DATABASE_URL) {
+  const tmpDir = path.join(__dirname, '..', 'tmp');
+  if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+  process.env.DATABASE_URL = `file:${path.join(tmpDir, 'test.db')}`;
+  console.log("DATABASE_URL not set; using default:", process.env.DATABASE_URL);
+}
 
 interface MigrationCheckResult {
   success: boolean;
@@ -33,12 +44,21 @@ interface MigrationCheckResult {
 
 class MigrationVerifier {
   private tempDbPath: string;
+  private tempDbUrl: string;
   private prismaBinary: string;
   private schemaPath: string;
   private migrationsPath: string;
+  private ephemeralPostgresDbName?: string;
+  private ephemeralAdminUrl?: string;
 
   constructor() {
+    if (!process.env.DATABASE_URL) {
+      process.env.DATABASE_URL = 'postgresql://prisma:prisma_password@localhost:5432/cidb';
+    }
     this.tempDbPath = path.join(os.tmpdir(), `prisma-verify-${Date.now()}.db`);
+    const tempDbName = `prisma-verify-${Date.now()}.db`;
+    this.tempDbPath = path.join(__dirname, '..', tempDbName);
+    this.tempDbUrl = `file:./${tempDbName}`;
     this.prismaBinary = 'npx prisma';
     this.schemaPath = path.join(__dirname, '../prisma/schema.prisma');
     this.migrationsPath = path.join(__dirname, '../prisma/migrations');
@@ -55,7 +75,9 @@ class MigrationVerifier {
         ...options,
       });
     } catch (error: any) {
-      throw new Error(`Command failed: ${command}\n${error.message}`);
+      const stdout = error.stdout ? `\nstdout:\n${error.stdout}` : '';
+      const stderr = error.stderr ? `\nstderr:\n${error.stderr}` : '';
+      throw new Error(`Command failed: ${command}\n${error.message}${stdout}${stderr}`);
     }
   }
 
@@ -70,7 +92,9 @@ class MigrationVerifier {
         ...options,
       });
     } catch (error: any) {
-      throw new Error(`Command failed: ${command}\n${error.message}`);
+      const stdout = error.stdout ? `\nstdout:\n${error.stdout}` : '';
+      const stderr = error.stderr ? `\nstderr:\n${error.stderr}` : '';
+      throw new Error(`Command failed: ${command}\n${error.message}${stdout}${stderr}`);
     }
   }
 
@@ -78,10 +102,168 @@ class MigrationVerifier {
    * Clean up temporary database
    */
   private cleanup(): void {
-    if (fs.existsSync(this.tempDbPath)) {
-      fs.unlinkSync(this.tempDbPath);
-      console.log('🧹 Cleaned up temporary database');
+    try {
+      if (fs.existsSync(this.tempDbPath)) {
+        fs.unlinkSync(this.tempDbPath);
+        console.log('🧹 Cleaned up temporary database');
+      }
+    } finally {
+      // Always drop ephemeral Postgres DB if it was created
+      this.dropEphemeralPostgresDatabase();
     }
+  }
+
+  /**
+   * Reset the database schema for PostgreSQL databases
+   * Drops and recreates the public schema to ensure a clean state
+   * Only runs when explicitly enabled via VERIFY_MIGRATIONS_ALLOW_RESET env var
+   *
+   * @param databaseUrl - Explicit database URL to reset (ensures consistency with migrate deploy)
+   */
+  private resetDatabaseSchema(databaseUrl?: string): boolean {
+    try {
+      // Only run this in CI/ephemeral environments with explicit permission
+      if (process.env.VERIFY_MIGRATIONS_ALLOW_RESET !== 'true') {
+        return true; // Skip reset if not explicitly enabled
+      }
+
+      const dbUrl = databaseUrl || process.env.DATABASE_URL;
+      if (!dbUrl) {
+        throw new Error('DATABASE_URL must be provided to reset database schema');
+      }
+
+      // If SQLite, no need to drop schema (file-based)
+      if (dbUrl.startsWith('file:')) {
+        return true; // SQLite doesn't need schema reset
+      }
+
+      // Safety check: do not drop non-local or production-looking databases
+      try {
+        // Parse PostgreSQL connection string safely
+        const dbUrlObj = new URL(dbUrl.replace(/^postgresql:\/\//, 'http://'));
+        const hostname = dbUrlObj.hostname || '';
+        const pathname = dbUrlObj.pathname || '';
+        const dbName = pathname.replace(/^\//, '').split('?')[0]; // Extract DB name before query params
+
+        // Allow only local/ci ephemeral hosts or names containing 'test' or 'prisma-verify'
+        const isLocalHost = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === 'postgres';
+        const isCiEnvironment = process.env.CI === 'true';
+        const isEphemeralName = /test|ci|prisma-verify/i.test(dbName);
+
+        if (!isLocalHost && !isCiEnvironment && !isEphemeralName) {
+          throw new Error(
+            `Refusing to reset schema for host '${hostname}' and db '${dbName}'. ` +
+            'Schema reset only allowed for ephemeral databases (local, CI, or containing test/ci/prisma-verify in name). ' +
+            'Set VERIFY_MIGRATIONS_ALLOW_RESET only for ephemeral DBs.'
+          );
+        }
+
+        console.log(`ℹ️  Reset allowed for ephemeral DB: host=${hostname}, name=${dbName}`);
+      } catch (parseErr) {
+        // If parsing fails, refuse to run reset to be safe
+        throw new Error(`Unable to safely parse database URL for reset safety check: ${parseErr}`);
+      }
+
+      console.log('🔄 Resetting database schema for migration verification...');
+
+      this.runSilent(
+        `${this.prismaBinary} db execute --url "${dbUrl}" --stdin`,
+        {
+          input: 'DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;',
+        }
+      );
+
+      console.log('✅ Database schema reset successfully');
+      return true;
+    } catch (error) {
+      console.error('❌ Failed to reset database schema:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Build a PostgreSQL URL with a different database name
+   */
+  private buildDbUrlWithDb(originalUrl: string, newDbName: string): string {
+    const url = new URL(originalUrl);
+    url.pathname = `/${newDbName}`;
+    return url.toString();
+  }
+
+  /**
+   * Create an ephemeral PostgreSQL database for migration verification
+   * This ensures each verification run has a clean, isolated database
+   */
+  private createEphemeralPostgresDatabase(originalUrl: string): string {
+    if (!originalUrl || originalUrl.startsWith('file:')) {
+      return originalUrl; // SQLite doesn't need ephemeral creation
+    }
+
+    // Build admin URL pointing to 'postgres' database to create new DB
+    const adminUrl = this.buildDbUrlWithDb(originalUrl, 'postgres');
+    this.ephemeralAdminUrl = adminUrl;
+
+    // Generate unique ephemeral DB name
+    const ephemName = `prisma_verify_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+    this.ephemeralPostgresDbName = ephemName;
+
+    console.log(`🔧 Creating ephemeral verification database: ${ephemName}`);
+
+    try {
+      this.runSilent(`${this.prismaBinary} db execute --url "${adminUrl}" --stdin`, {
+        input: `CREATE DATABASE "${ephemName}";`,
+      });
+    } catch (err) {
+      console.error('❌ Failed to create ephemeral database:', err);
+      throw err;
+    }
+
+    // Build and return URL pointing to new ephemeral DB
+    const newUrl = this.buildDbUrlWithDb(originalUrl, ephemName);
+
+    // Wait for the new DB to be ready before returning
+    this.waitForDbReady(newUrl);
+
+    return newUrl;
+  }
+
+  /**
+   * Drop ephemeral PostgreSQL database during cleanup
+   */
+  private dropEphemeralPostgresDatabase(): void {
+    try {
+      if (this.ephemeralPostgresDbName && this.ephemeralAdminUrl) {
+        console.log(`🧹 Dropping ephemeral database: ${this.ephemeralPostgresDbName}`);
+        this.runSilent(`${this.prismaBinary} db execute --url "${this.ephemeralAdminUrl}" --stdin`, {
+          input: `DROP DATABASE IF EXISTS "${this.ephemeralPostgresDbName}";`,
+        });
+      }
+    } catch (err) {
+      console.warn('⚠️  Failed to drop ephemeral database:', err);
+    }
+  }
+
+  /**
+   * Wait for database to be ready by polling with SELECT 1
+   */
+  private waitForDbReady(dbUrl: string, attempts = 15, delayMs = 500): void {
+    for (let i = 0; i < attempts; i++) {
+      try {
+        this.runSilent(`${this.prismaBinary} db execute --url "${dbUrl}" --stdin`, {
+          input: 'SELECT 1;',
+        });
+        console.log(`✅ Database is ready`);
+        return;
+      } catch (err) {
+        if (i < attempts - 1) {
+          const ms = delayMs * (i + 1);
+          console.log(`⏳ Waiting for DB readiness (${i + 1}/${attempts}) - retrying in ${ms}ms`);
+          // Use setTimeout to avoid blocking
+          execSync(`sleep ${(ms / 1000).toFixed(3)}`);
+        }
+      }
+    }
+    throw new Error(`Timed out waiting for database to become ready after ${attempts} attempts`);
   }
 
   /**
@@ -108,14 +290,28 @@ class MigrationVerifier {
   private applyMigrations(): boolean {
     try {
       console.log('🔄 Applying migrations to temporary database...');
-      
-      const env = {
+
+      let env = {
         ...process.env,
-        DATABASE_URL: `file:${this.tempDbPath}`,
+        DATABASE_URL: process.env.DATABASE_URL || 'postgresql://prisma:prisma_password@localhost:5432/cidb',
       };
 
-      // Reset and apply migrations
-      this.runSilent(`${this.prismaBinary} migrate reset --force`, {
+      // If DATABASE_URL is Postgres, create a unique ephemeral DB to avoid collisions
+      if (!env.DATABASE_URL!.startsWith('file:')) {
+        env.DATABASE_URL = this.createEphemeralPostgresDatabase(env.DATABASE_URL!);
+      }
+
+      // Reset schema before applying migrations to ensure clean state
+      // Pass the explicit DATABASE_URL so reset and migrate operate on the same DB
+      if (!this.resetDatabaseSchema(env.DATABASE_URL)) {
+        throw new Error('Failed to reset database schema');
+      }
+
+      // Ensure DB is ready before applying migrations
+      this.waitForDbReady(env.DATABASE_URL);
+
+      // Apply committed migrations to the temporary database.
+      this.runSilent(`${this.prismaBinary} migrate deploy`, {
         env,
         cwd: path.join(__dirname, '..'),
       });
@@ -137,7 +333,7 @@ class MigrationVerifier {
 
       const env = {
         ...process.env,
-        DATABASE_URL: `file:${this.tempDbPath}`,
+        DATABASE_URL: process.env.DATABASE_URL || 'postgresql://prisma:prisma_password@localhost:5432/cidb',
       };
 
       // Check if the database schema matches the Prisma schema
@@ -150,7 +346,7 @@ class MigrationVerifier {
       );
 
       // If there's any diff output, there's inconsistency
-      if (diffOutput.trim() && !diffOutput.includes('No difference')) {
+      if (diffOutput.trim() && !diffOutput.includes('No difference') && !diffOutput.includes('-- This is an empty migration.')) {
         console.error('❌ Schema inconsistency detected:');
         console.error(diffOutput);
         return false;
@@ -173,13 +369,14 @@ class MigrationVerifier {
 
       const env = {
         ...process.env,
-        DATABASE_URL: `file:${this.tempDbPath}`,
+        DATABASE_URL: process.env.DATABASE_URL || 'postgresql://prisma:prisma_password@localhost:5432/cidb',
       };
 
       // Use Prisma migrate diff to detect destructive changes
       try {
+        const shadowUrl = process.env.SHADOW_DATABASE_URL || 'postgresql://prisma:prisma_password@localhost:5433/shadowdb';
         this.runSilent(
-          `${this.prismaBinary} migrate diff --from-migrations prisma/migrations --to-schema-datamodel prisma/schema.prisma --exit-code`,
+          `${this.prismaBinary} migrate diff --from-migrations prisma/migrations --to-schema-datamodel prisma/schema.prisma --shadow-database-url "${shadowUrl}" --exit-code`,
           {
             env,
             cwd: path.join(__dirname, '..'),
@@ -214,7 +411,7 @@ class MigrationVerifier {
 
       const env = {
         ...process.env,
-        DATABASE_URL: `file:${this.tempDbPath}`,
+        DATABASE_URL: process.env.DATABASE_URL || 'postgresql://prisma:prisma_password@localhost:5432/cidb',
       };
 
       // Get the list of migrations
@@ -266,7 +463,7 @@ class MigrationVerifier {
 
       for (const migrationDir of migrationDirs) {
         const migrationSqlPath = path.join(this.migrationsPath, migrationDir, 'migration.sql');
-        
+
         if (!fs.existsSync(migrationSqlPath)) {
           console.error(`❌ Migration ${migrationDir} missing migration.sql`);
           return false;
@@ -401,7 +598,7 @@ if (require.main === module) {
   const verifier = new MigrationVerifier();
   const result = verifier.verify();
   verifier.printResults(result);
-  
+
   process.exit(result.success ? 0 : 1);
 }
 

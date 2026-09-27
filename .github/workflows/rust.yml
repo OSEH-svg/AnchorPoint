@@ -1,21 +1,83 @@
-name: Rust Contracts CI
+name: Rust CI
 
 on:
-  push:
-    branches: ["**"]
   pull_request:
-    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "contracts/**"
 
 jobs:
-  test:
+  rust-checks:
+    name: Clippy and tests
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          components: clippy
+
       - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy -p anchorpoint-utils -p anchorpoint-security-registry -p event-hub --all-targets --all-features -- -D warnings
+
+      - name: Build (wasm32)
+        run: cargo build --target wasm32v1-none --release
+
+      - name: Install binaryen (wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+
+      - name: WASM Optimization & Size Threshold Check
+        run: |
+          chmod +x tools/optimize-wasm.sh
+          ./tools/optimize-wasm.sh target/wasm32v1-none/release
+
+      - uses: taiki-e/install-action@v2
+
+        with:
+          tool: cargo-scout-audit@0.3.16
+
+      - name: Install Scout system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config gcc
+
       - name: Test sep41-token
         run: cargo test -p sep41-token
+
       - name: Test upgradeable
         run: cargo test -p upgradeable
+
+      - name: Run Security Audit
+        run: ./scripts/security-audit.sh --warn-only
+      - name: Test
+        run: cargo test -p anchorpoint-utils -p anchorpoint-security-registry -p event-hub --all-features
+
+  mutation-testing:
+    name: Mutation testing (cargo-mutants)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config gcc
+
+      - name: Mutation test token and staking contracts
+        run: cargo mutants --config mutants.toml -p sep41-token -p staking -j 2
+
+      - name: Mutation test liquid staking contract
+        working-directory: contracts
+        run: cargo mutants --config mutants.toml -p liquid_staking --in-place

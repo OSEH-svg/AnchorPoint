@@ -1,11 +1,15 @@
 import {
+  buildKycStatusChangedPayload,
   buildTransactionStatusChangedPayload,
+  calculateExponentialBackoff,
   signWebhookPayload,
   updateTransactionStatusAndNotify,
   verifyWebhookSignature,
   WebhookService,
+  type KycWebhookRecord,
   type TransactionWebhookRecord,
 } from './webhook.service';
+import { InMemoryWebhookDeliveryStore } from './idempotentWebhook.service';
 
 const baseTransaction: TransactionWebhookRecord = {
   id: 'txn_123',
@@ -22,6 +26,49 @@ const baseTransaction: TransactionWebhookRecord = {
     publicKey: 'GBPUBLICKEY123',
   },
 };
+
+const baseKycCustomer: KycWebhookRecord = {
+  id: 'kyc_123',
+  userId: 'user_123',
+  provider: 'mock',
+  providerRef: 'mock_123',
+  status: 'ACCEPTED',
+  createdAt: new Date('2026-03-30T10:00:00.000Z'),
+  updatedAt: new Date('2026-03-30T10:05:00.000Z'),
+  user: {
+    publicKey: 'GBPUBLICKEY123',
+  },
+};
+
+const makeService = (
+  httpClient: jest.Mock,
+  extras: {
+    sleep?: jest.Mock;
+    deliveryStore?: InMemoryWebhookDeliveryStore;
+    enqueueRetry?: jest.Mock;
+    maxRetries?: number;
+  } = {}
+) =>
+  new WebhookService(
+    {
+      url: 'https://example.com/webhooks',
+      secret: 'super-secret',
+      timeoutMs: 1000,
+      maxRetries: extras.maxRetries ?? 2,
+      retryDelayMs: 50,
+    },
+    {
+      httpClient,
+      sleep: extras.sleep ?? jest.fn().mockResolvedValue(undefined),
+      deliveryStore: extras.deliveryStore ?? new InMemoryWebhookDeliveryStore(),
+      enqueueRetry: extras.enqueueRetry ?? jest.fn().mockResolvedValue(null),
+      logger: {
+        info: jest.fn(),
+        warn: jest.fn(),
+        error: jest.fn(),
+      },
+    }
+  );
 
 describe('Webhook Service', () => {
   afterEach(() => {
@@ -46,6 +93,54 @@ describe('Webhook Service', () => {
         status: 'COMPLETED',
         externalId: 'ext_123',
         stellarTxId: 'stellar_123',
+        createdAt: '2026-03-30T10:00:00.000Z',
+        updatedAt: '2026-03-30T10:05:00.000Z',
+      },
+    });
+  });
+
+  it('builds a customer KYC status updated payload with provider identifiers', () => {
+    const payload = buildKycStatusChangedPayload(baseKycCustomer, 'PENDING');
+
+    expect(payload).toEqual({
+      event: 'customer.kyc_status_updated',
+      occurredAt: expect.any(String),
+      previousStatus: 'PENDING',
+      customer: {
+        id: 'kyc_123',
+        userId: 'user_123',
+        account: 'GBPUBLICKEY123',
+        provider: 'mock',
+        providerRef: 'mock_123',
+        status: 'ACCEPTED',
+        createdAt: '2026-03-30T10:00:00.000Z',
+        updatedAt: '2026-03-30T10:05:00.000Z',
+      },
+    });
+  });
+
+  it('includes rejection reason codes in webhook payload when status is REJECTED', () => {
+    const rejectedCustomer: KycWebhookRecord = {
+      ...baseKycCustomer,
+      status: 'REJECTED',
+      rejectionReasons: ['ID_DOCUMENT_EXPIRED', 'ADDRESS_MISMATCH'],
+    };
+
+    const payload = buildKycStatusChangedPayload(rejectedCustomer, 'PENDING');
+
+    expect(payload).toEqual({
+      event: 'customer.kyc_status_updated',
+      occurredAt: expect.any(String),
+      previousStatus: 'PENDING',
+      customer: {
+        id: 'kyc_123',
+        userId: 'user_123',
+        account: 'GBPUBLICKEY123',
+        provider: 'mock',
+        providerRef: 'mock_123',
+        status: 'REJECTED',
+        rejectionReasons: ['ID_DOCUMENT_EXPIRED', 'ADDRESS_MISMATCH'],
+        rejectionReasonCodes: ['ID_DOCUMENT_EXPIRED', 'ADDRESS_MISMATCH'],
         createdAt: '2026-03-30T10:00:00.000Z',
         updatedAt: '2026-03-30T10:05:00.000Z',
       },
@@ -77,24 +172,7 @@ describe('Webhook Service', () => {
         text: async () => 'ok',
       });
 
-    const service = new WebhookService(
-      {
-        url: 'https://example.com/webhooks',
-        secret: 'super-secret',
-        timeoutMs: 1000,
-        maxRetries: 2,
-        retryDelayMs: 50,
-      },
-      {
-        httpClient,
-        sleep: sleepFn,
-        logger: {
-          info: jest.fn(),
-          warn: jest.fn(),
-          error: jest.fn(),
-        },
-      }
-    );
+    const service = makeService(httpClient, { sleep: sleepFn });
 
     const result = await service.sendTransactionStatusChanged(baseTransaction, 'PENDING');
 
@@ -109,7 +187,50 @@ describe('Webhook Service', () => {
 
     const [, request] = httpClient.mock.calls[0] as [string, { headers: Record<string, string>; body: string }];
     expect(request.headers['x-anchorpoint-event']).toBe('transaction.status_changed');
+    expect(request.headers['Idempotency-Key']).toBe('sep24:txn_123:PENDING->COMPLETED');
     expect(request.headers['x-anchorpoint-signature']).toMatch(/^sha256=/);
+    expect(
+      verifyWebhookSignature(
+        request.body,
+        'super-secret',
+        request.headers['x-anchorpoint-timestamp'],
+        request.headers['x-anchorpoint-signature']
+      )
+    ).toBe(true);
+  });
+
+  it('sends signed customer.kyc_status_updated webhook events with rejection reasons', async () => {
+    const httpClient = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => 'ok',
+    });
+
+    const service = makeService(httpClient);
+    const rejectedCustomer: KycWebhookRecord = {
+      ...baseKycCustomer,
+      status: 'REJECTED',
+    };
+
+    const result = await service.sendKycStatusChanged(
+      rejectedCustomer,
+      'PENDING',
+      ['SANCTIONS_HIT']
+    );
+
+    expect(result).toEqual({
+      delivered: true,
+      attempts: 1,
+      statusCode: 200,
+      responseBody: 'ok',
+    });
+    expect(httpClient).toHaveBeenCalledTimes(1);
+
+    const [, request] = httpClient.mock.calls[0] as [string, { headers: Record<string, string>; body: string }];
+    expect(request.headers['x-anchorpoint-event']).toBe('customer.kyc_status_updated');
+    expect(request.headers['Idempotency-Key']).toBe('sep12:kyc_123:PENDING->REJECTED');
+    expect(request.body).toContain('"event":"customer.kyc_status_updated"');
+    expect(request.body).toContain('"rejectionReasons":["SANCTIONS_HIT"]');
     expect(
       verifyWebhookSignature(
         request.body,
@@ -126,25 +247,9 @@ describe('Webhook Service', () => {
       status: 400,
       text: async () => 'bad request',
     });
+    const enqueueRetry = jest.fn().mockResolvedValue('job-1');
 
-    const service = new WebhookService(
-      {
-        url: 'https://example.com/webhooks',
-        secret: 'super-secret',
-        timeoutMs: 1000,
-        maxRetries: 3,
-        retryDelayMs: 50,
-      },
-      {
-        httpClient,
-        sleep: jest.fn(),
-        logger: {
-          info: jest.fn(),
-          warn: jest.fn(),
-          error: jest.fn(),
-        },
-      }
-    );
+    const service = makeService(httpClient, { enqueueRetry, maxRetries: 3 });
 
     const result = await service.sendTransactionStatusChanged(baseTransaction, 'PENDING');
 
@@ -156,33 +261,42 @@ describe('Webhook Service', () => {
       error: 'Webhook responded with status 400',
     });
     expect(httpClient).toHaveBeenCalledTimes(1);
+    expect(enqueueRetry).toHaveBeenCalled();
   });
 
   it('skips delivery when the status did not change', async () => {
-    const service = new WebhookService(
-      {
-        url: 'https://example.com/webhooks',
-        secret: 'super-secret',
-        timeoutMs: 1000,
-        maxRetries: 3,
-        retryDelayMs: 50,
-      },
-      {
-        httpClient: jest.fn(),
-        sleep: jest.fn(),
-        logger: {
-          info: jest.fn(),
-          warn: jest.fn(),
-          error: jest.fn(),
-        },
-      }
-    );
+    const service = makeService(jest.fn());
 
     await expect(service.sendTransactionStatusChanged(baseTransaction, 'COMPLETED')).resolves.toEqual({
       delivered: false,
       attempts: 0,
       skipped: true,
     });
+    await expect(service.sendKycStatusChanged(baseKycCustomer, 'ACCEPTED')).resolves.toEqual({
+      delivered: false,
+      attempts: 0,
+      skipped: true,
+    });
+  });
+
+  it('prevents duplicate webhook emissions for identical status transitions via Redis hash store', async () => {
+    const httpClient = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => 'ok',
+    });
+    const deliveryStore = new InMemoryWebhookDeliveryStore();
+    const service = makeService(httpClient, { deliveryStore });
+
+    await service.sendTransactionStatusChanged(baseTransaction, 'PENDING');
+    const second = await service.sendTransactionStatusChanged(baseTransaction, 'PENDING');
+
+    expect(second).toEqual({
+      delivered: false,
+      attempts: 0,
+      skipped: true,
+    });
+    expect(httpClient).toHaveBeenCalledTimes(1);
   });
 
   it('updates a transaction and notifies through the webhook service', async () => {
@@ -212,13 +326,17 @@ describe('Webhook Service', () => {
       } as unknown as WebhookService,
     });
 
-    expect(findUnique).toHaveBeenCalledWith(expect.objectContaining({
-      where: { id: 'txn_123' },
-    }));
-    expect(update).toHaveBeenCalledWith(expect.objectContaining({
-      where: { id: 'txn_123' },
-      data: { status: 'COMPLETED' },
-    }));
+    expect(findUnique).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'txn_123' },
+      })
+    );
+    expect(update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'txn_123' },
+        data: { status: 'COMPLETED' },
+      })
+    );
     expect(sendTransactionStatusChanged).toHaveBeenCalledWith(baseTransaction, 'PENDING');
     expect(result).toEqual({
       transaction: baseTransaction,
@@ -258,5 +376,37 @@ describe('Webhook Service', () => {
         skipped: true,
       },
     });
+  });
+
+  it('calculates exponential backoff delays (2s, 4s, 8s, 16s, 32s)', () => {
+    expect(calculateExponentialBackoff(1, 2000)).toBe(2000);
+    expect(calculateExponentialBackoff(2, 2000)).toBe(4000);
+    expect(calculateExponentialBackoff(3, 2000)).toBe(8000);
+    expect(calculateExponentialBackoff(4, 2000)).toBe(16000);
+    expect(calculateExponentialBackoff(5, 2000)).toBe(32000);
+  });
+
+  it('retries up to maxRetries on HTTP 500 errors with exponential backoff sequence', async () => {
+    const sleepFn = jest.fn().mockResolvedValue(undefined);
+    const httpClient = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+      text: async () => 'Internal Server Error',
+    });
+    const enqueueRetry = jest.fn().mockResolvedValue('retry-job-id');
+
+    const service = makeService(httpClient, { sleep: sleepFn, enqueueRetry, maxRetries: 5 });
+
+    const result = await service.sendKycStatusChanged(baseKycCustomer, 'PENDING');
+
+    expect(result.delivered).toBe(false);
+    expect(result.attempts).toBe(6);
+    expect(httpClient).toHaveBeenCalledTimes(6);
+    expect(sleepFn).toHaveBeenNthCalledWith(1, 2000);
+    expect(sleepFn).toHaveBeenNthCalledWith(2, 4000);
+    expect(sleepFn).toHaveBeenNthCalledWith(3, 8000);
+    expect(sleepFn).toHaveBeenNthCalledWith(4, 16000);
+    expect(sleepFn).toHaveBeenNthCalledWith(5, 32000);
+    expect(enqueueRetry).toHaveBeenCalled();
   });
 });

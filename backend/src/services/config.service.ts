@@ -2,6 +2,8 @@ import { dynamicConfigSchema, DynamicConfig, initialDynamicConfig, DashboardUiCo
 import prisma from '../lib/prisma';
 import { redis } from '../lib/redis';
 import logger from '../utils/logger';
+import { Prisma } from '@prisma/client';
+import { adminAuditService, AuditActor } from './admin-audit.service';
 
 const REDIS_CHANNEL = 'CONFIG_UPDATED';
 
@@ -15,13 +17,13 @@ class ConfigService {
   }
 
   private setupRedisSubscriber() {
-    this.subscriber.subscribe(REDIS_CHANNEL, (err) => {
+    this.subscriber.subscribe(REDIS_CHANNEL, (err: Error | null) => {
       if (err) {
         logger.error('Failed to subscribe to config updates:', err);
       }
     });
 
-    this.subscriber.on('message', async (channel, message) => {
+    this.subscriber.on('message', async (channel: string, message: string) => {
       if (channel === REDIS_CHANNEL) {
         logger.info(`Received config update notification (version: ${message}), refreshing...`);
         await this.refreshConfig();
@@ -73,6 +75,10 @@ class ConfigService {
     return this.currentConfig.ui;
   }
 
+  public getSep31Config(): DynamicConfig['sep31'] {
+    return this.currentConfig.sep31;
+  }
+
   public async getHistory() {
     return prisma.systemConfig.findMany({
       orderBy: { version: 'desc' },
@@ -80,9 +86,16 @@ class ConfigService {
     });
   }
 
-  public async updateConfig(newSettings: unknown) {
+  public async updateConfig(
+    newSettings: unknown,
+    actor?: AuditActor,
+    action: 'CONFIG_UPDATE' | 'CONFIG_UI_UPDATE' = 'CONFIG_UPDATE'
+  ) {
     // Validate the new settings
     const validated = dynamicConfigSchema.parse(newSettings);
+
+    // Snapshot the previous config for the audit diff.
+    const previousConfig = this.currentConfig;
 
     // Run in transaction: unset isActive, insert new config
     const activeConfig = await prisma.systemConfig.findFirst({
@@ -91,7 +104,7 @@ class ConfigService {
 
     const newVersion = (activeConfig?.version || 0) + 1;
 
-    const result = await prisma.$transaction(async (tx) => {
+    const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       if (activeConfig) {
         await tx.systemConfig.update({
           where: { id: activeConfig.id },
@@ -109,14 +122,24 @@ class ConfigService {
     });
 
     this.currentConfig = validated;
-    
+
+    // Record the change in the immutable admin audit trail (best-effort).
+    await adminAuditService.recordConfigChange({
+      action,
+      actor,
+      configVersion: result.version,
+      previousVersion: activeConfig?.version ?? null,
+      before: previousConfig as unknown as Record<string, unknown>,
+      after: validated as unknown as Record<string, unknown>,
+    });
+
     // Notify other instances
     await redis.publish(REDIS_CHANNEL, result.version.toString());
 
     return result;
   }
 
-  public async updateUiConfig(uiSettings: unknown) {
+  public async updateUiConfig(uiSettings: unknown, actor?: AuditActor) {
     const nextConfig = {
       ...this.currentConfig,
       ui: {
@@ -129,10 +152,10 @@ class ConfigService {
       },
     };
 
-    return this.updateConfig(nextConfig);
+    return this.updateConfig(nextConfig, actor, 'CONFIG_UI_UPDATE');
   }
 
-  public async rollbackToVersion(version: number) {
+  public async rollbackToVersion(version: number, actor?: AuditActor) {
     const targetConfig = await prisma.systemConfig.findUnique({
       where: { version },
     });
@@ -143,13 +166,15 @@ class ConfigService {
 
     const parsed = dynamicConfigSchema.parse(JSON.parse(targetConfig.settings));
 
+    const previousConfig = this.currentConfig;
+
     const activeConfig = await prisma.systemConfig.findFirst({
       where: { isActive: true },
     });
 
     const newVersion = (activeConfig?.version || 0) + 1;
 
-    const result = await prisma.$transaction(async (tx) => {
+    const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       if (activeConfig) {
         await tx.systemConfig.update({
           where: { id: activeConfig.id },
@@ -167,7 +192,18 @@ class ConfigService {
     });
 
     this.currentConfig = parsed;
-    
+
+    // Record the rollback in the audit trail (best-effort).
+    await adminAuditService.recordConfigChange({
+      action: 'CONFIG_ROLLBACK',
+      actor,
+      configVersion: result.version,
+      previousVersion: activeConfig?.version ?? null,
+      before: previousConfig as unknown as Record<string, unknown>,
+      after: parsed as unknown as Record<string, unknown>,
+      metadata: { rolledBackToVersion: version },
+    });
+
     // Notify other instances
     await redis.publish(REDIS_CHANNEL, result.version.toString());
 

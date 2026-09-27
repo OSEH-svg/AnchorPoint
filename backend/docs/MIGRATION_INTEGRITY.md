@@ -294,6 +294,98 @@ Before deploying migrations to production:
 - [ ] Monitoring alerts configured
 - [ ] Maintenance window scheduled (if needed)
 
+## Rollback Verification Procedure
+
+### Overview
+
+`backend/scripts/rollback.ts` is a dedicated rollback verification script that checks **foreign key integrity before applying a rollback**. It is distinct from `generate-rollback.ts` (which only generates the SQL file) — this script validates, reports, and then applies the rollback.
+
+### How It Works
+
+1. **Locate rollback SQL** — finds `rollback.sql` in the target migration directory. If it does not exist, it auto-generates one using `RollbackGenerator`.
+2. **Parse DROP TABLE statements** — extracts tables that would be removed by the rollback.
+3. **FK impact analysis** — for every table referencing a to-be-dropped table, counts rows that would become orphaned:
+   - Uses `PRAGMA foreign_key_list(table)` to discover FK relationships.
+   - Uses `PRAGMA foreign_key_check` to surface any pre-existing violations.
+4. **Print integrity report** — categorises each FK reference as **safe** (0 referencing rows) or **blocking** (≥1 orphaned rows).
+5. **Confirm before applying** — prompts for `y/N` unless `--force` is passed.
+6. **Apply rollback** — executes each SQL statement via Prisma's `$executeRawUnsafe`.
+
+### Usage
+
+```bash
+# Rollback the latest migration (interactive confirmation)
+npm run migrate:rollback:verify
+
+# Rollback a specific migration
+npm run migrate:rollback:verify -- 20240101_add_user_table
+
+# Dry-run: check FKs but do NOT apply
+npm run migrate:rollback:verify -- --dry-run
+
+# Skip confirmation prompt (CI / emergency)
+npm run migrate:rollback:verify -- --force
+```
+
+### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| `0`  | Rollback applied (or dry-run passed) |
+| `1`  | FK violations found and `--force` not set, or rollback SQL execution failed |
+
+### Example Output
+
+```
+🔍 Migration Rollback Verifier
+============================================================
+
+📁 Target migration: 20240101000000_add_orders
+📄 Rollback SQL: prisma/migrations/20240101000000_add_orders/rollback.sql
+🗑  Tables to be dropped: Order
+
+🔎 Checking foreign key integrity...
+
+============================================================
+  Foreign Key Integrity Report
+============================================================
+
+✅ No pre-existing FK violations in current database state.
+
+❌ FK violations that WILL occur after rollback (1):
+   • OrderItem.orderId → Order.id (42 referencing rows)
+
+   ⚠️  These rows will have dangling foreign key references after the rollback.
+   ⚠️  Consider cleaning up referencing rows before rolling back,
+       or use --force to apply anyway (NOT recommended for production).
+============================================================
+
+❌ FK violations detected. Use --force to apply anyway (may break referential integrity).
+```
+
+### CD Pipeline Integration
+
+Add rollback verification as a pre-gate in your CD pipeline:
+
+```yaml
+# .github/workflows/cd.yml
+- name: Verify rollback safety
+  run: npm run migrate:rollback:verify -- --dry-run
+  working-directory: backend
+  env:
+    DATABASE_URL: ${{ secrets.DATABASE_URL }}
+```
+
+Use `--dry-run` in CI so the step reports FK risk without mutating the database. Treat exit code `1` as a deployment blocker until the team reviews and resolves the FK dependencies.
+
+### Relationship Between Migration Scripts
+
+| Script | npm command | Purpose |
+|--------|-------------|---------|
+| `generate-rollback.ts` | `migrate:rollback` | Generate `rollback.sql` from forward migration SQL |
+| `rollback.ts` | `migrate:rollback:verify` | Verify FK integrity **and** apply rollback |
+| `migration-integrity-checker.ts` | `migrate:check` | Full pre-deploy integrity suite |
+
 ## Support
 
 For issues or questions:

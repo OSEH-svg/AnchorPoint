@@ -1,9 +1,11 @@
 #![cfg(test)]
 
-use super::{BatchExecutor, BatchExecutorClient, Call, CallWithRetry, OpStatus, RetryConfig};
+use super::{BatchExecutor, BatchExecutorClient, Call, CallWithRetry, OpStatus, RetryConfig, TransferOp};
 use soroban_sdk::{
+    contract, contractimpl, symbol_short, testutils::Address as _, Env, IntoVal, Vec,
     contract, contractimpl, symbol_short,
     testutils::Address as _,
+    token::StellarAssetClient,
     Env, IntoVal, Vec,
 };
 
@@ -46,10 +48,13 @@ impl BrokenContract {
 }
 
 fn default_retry(max_attempts: u32) -> RetryConfig {
-    RetryConfig { max_attempts, delay_ledgers: 0 }
+    RetryConfig {
+        max_attempts,
+        delay_ledgers: 0,
+    }
 }
 
-fn setup(env: &Env) -> BatchExecutorClient {
+fn setup(env: &Env) -> BatchExecutorClient<'_> {
     let id = env.register(BatchExecutor, ());
     let client = BatchExecutorClient::new(env, &id);
     let admin = soroban_sdk::Address::generate(env);
@@ -64,10 +69,21 @@ fn test_execute_batch() {
     let client = setup(&env);
     let mock_id = env.register(MockContract, ());
 
-    let calls = Vec::from_array(&env, [
-        Call { contract: mock_id.clone(), function: symbol_short!("echo"), args: (123u32,).into_val(&env) },
-        Call { contract: mock_id.clone(), function: symbol_short!("echo"), args: (456u32,).into_val(&env) },
-    ]);
+    let calls = Vec::from_array(
+        &env,
+        [
+            Call {
+                contract: mock_id.clone(),
+                function: symbol_short!("echo"),
+                args: (123u32,).into_val(&env),
+            },
+            Call {
+                contract: mock_id.clone(),
+                function: symbol_short!("echo"),
+                args: (456u32,).into_val(&env),
+            },
+        ],
+    );
 
     let caller = soroban_sdk::Address::generate(&env);
     let results = client.execute_batch(&caller, &calls);
@@ -87,7 +103,11 @@ fn test_retry_all_succeed_first_try() {
     let mock_id = env.register(MockContract, ());
 
     let make = |v: u32| CallWithRetry {
-        call: Call { contract: mock_id.clone(), function: symbol_short!("echo"), args: (v,).into_val(&env) },
+        call: Call {
+            contract: mock_id.clone(),
+            function: symbol_short!("echo"),
+            args: (v,).into_val(&env),
+        },
         retry: default_retry(3),
     };
 
@@ -123,26 +143,29 @@ fn test_retry_succeeds_after_retries() {
     let broken_id = env.register(BrokenContract, ());
     let mock_id = env.register(MockContract, ());
 
-    let calls = Vec::from_array(&env, [
-        // This one will fail twice (max_attempts=2) then be marked Failed
-        CallWithRetry {
-            call: Call {
-                contract: broken_id.clone(),
-                function: symbol_short!("broken"),
-                args: Vec::new(&env),
+    let calls = Vec::from_array(
+        &env,
+        [
+            // This one will fail twice (max_attempts=2) then be marked Failed
+            CallWithRetry {
+                call: Call {
+                    contract: broken_id.clone(),
+                    function: symbol_short!("broken"),
+                    args: Vec::new(&env),
+                },
+                retry: default_retry(2),
             },
-            retry: default_retry(2),
-        },
-        // This one succeeds on first attempt
-        CallWithRetry {
-            call: Call {
-                contract: mock_id.clone(),
-                function: symbol_short!("echo"),
-                args: (42u32,).into_val(&env),
+            // This one succeeds on first attempt
+            CallWithRetry {
+                call: Call {
+                    contract: mock_id.clone(),
+                    function: symbol_short!("echo"),
+                    args: (42u32,).into_val(&env),
+                },
+                retry: default_retry(3),
             },
-            retry: default_retry(3),
-        },
-    ]);
+        ],
+    );
 
     let caller = soroban_sdk::Address::generate(&env);
     let batch = client.execute_batch_with_retry(&caller, &calls, &false);
@@ -169,16 +192,27 @@ fn test_failed_call_does_not_abort_batch() {
     let broken_id = env.register(BrokenContract, ());
     let mock_id = env.register(MockContract, ());
 
-    let calls = Vec::from_array(&env, [
-        CallWithRetry {
-            call: Call { contract: broken_id.clone(), function: symbol_short!("broken"), args: Vec::new(&env) },
-            retry: default_retry(2),
-        },
-        CallWithRetry {
-            call: Call { contract: mock_id.clone(), function: symbol_short!("echo"), args: (99u32,).into_val(&env) },
-            retry: default_retry(1),
-        },
-    ]);
+    let calls = Vec::from_array(
+        &env,
+        [
+            CallWithRetry {
+                call: Call {
+                    contract: broken_id.clone(),
+                    function: symbol_short!("broken"),
+                    args: Vec::new(&env),
+                },
+                retry: default_retry(2),
+            },
+            CallWithRetry {
+                call: Call {
+                    contract: mock_id.clone(),
+                    function: symbol_short!("echo"),
+                    args: (99u32,).into_val(&env),
+                },
+                retry: default_retry(1),
+            },
+        ],
+    );
 
     let caller = soroban_sdk::Address::generate(&env);
     let batch = client.execute_batch_with_retry(&caller, &calls, &false);
@@ -199,20 +233,35 @@ fn test_abort_on_failure_skips_remaining() {
     let broken_id = env.register(BrokenContract, ());
     let mock_id = env.register(MockContract, ());
 
-    let calls = Vec::from_array(&env, [
-        CallWithRetry {
-            call: Call { contract: broken_id.clone(), function: symbol_short!("broken"), args: Vec::new(&env) },
-            retry: default_retry(1),
-        },
-        CallWithRetry {
-            call: Call { contract: mock_id.clone(), function: symbol_short!("echo"), args: (7u32,).into_val(&env) },
-            retry: default_retry(1),
-        },
-        CallWithRetry {
-            call: Call { contract: mock_id.clone(), function: symbol_short!("echo"), args: (8u32,).into_val(&env) },
-            retry: default_retry(1),
-        },
-    ]);
+    let calls = Vec::from_array(
+        &env,
+        [
+            CallWithRetry {
+                call: Call {
+                    contract: broken_id.clone(),
+                    function: symbol_short!("broken"),
+                    args: Vec::new(&env),
+                },
+                retry: default_retry(1),
+            },
+            CallWithRetry {
+                call: Call {
+                    contract: mock_id.clone(),
+                    function: symbol_short!("echo"),
+                    args: (7u32,).into_val(&env),
+                },
+                retry: default_retry(1),
+            },
+            CallWithRetry {
+                call: Call {
+                    contract: mock_id.clone(),
+                    function: symbol_short!("echo"),
+                    args: (8u32,).into_val(&env),
+                },
+                retry: default_retry(1),
+            },
+        ],
+    );
 
     let caller = soroban_sdk::Address::generate(&env);
     let batch = client.execute_batch_with_retry(&caller, &calls, &true);
@@ -235,10 +284,17 @@ fn test_nonce_increments() {
 
     assert_eq!(client.get_nonce(&caller), 0);
 
-    let calls = Vec::from_array(&env, [CallWithRetry {
-        call: Call { contract: mock_id.clone(), function: symbol_short!("echo"), args: (1u32,).into_val(&env) },
-        retry: default_retry(1),
-    }]);
+    let calls = Vec::from_array(
+        &env,
+        [CallWithRetry {
+            call: Call {
+                contract: mock_id.clone(),
+                function: symbol_short!("echo"),
+                args: (1u32,).into_val(&env),
+            },
+            retry: default_retry(1),
+        }],
+    );
 
     client.execute_batch_with_retry(&caller, &calls, &false);
     assert_eq!(client.get_nonce(&caller), 1);
@@ -249,6 +305,143 @@ fn test_nonce_increments() {
 
 #[test]
 fn test_retry_config_clamping() {
-    assert_eq!(RetryConfig { max_attempts: 0, delay_ledgers: 0 }.validated().max_attempts, 1);
-    assert_eq!(RetryConfig { max_attempts: 99, delay_ledgers: 0 }.validated().max_attempts, 5);
+    assert_eq!(
+        RetryConfig {
+            max_attempts: 0,
+            delay_ledgers: 0
+        }
+        .validated()
+        .max_attempts,
+        1
+    );
+    assert_eq!(
+        RetryConfig {
+            max_attempts: 99,
+            delay_ledgers: 0
+        }
+        .validated()
+        .max_attempts,
+        5
+    );
+}
+
+// ============================================================================
+// execute_transfers tests
+// ============================================================================
+
+fn mint_and_setup_token(env: &Env, admin: &soroban_sdk::Address, amount: i128) -> soroban_sdk::Address {
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let addr = sac.address();
+    StellarAssetClient::new(env, &addr).mint(admin, &amount);
+    addr
+}
+
+#[test]
+fn test_execute_transfers_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let batch_client = setup(&env);
+
+    let admin = soroban_sdk::Address::generate(&env);
+    let recipient = soroban_sdk::Address::generate(&env);
+    let token_addr = mint_and_setup_token(&env, &admin, 1000);
+
+    let ops = Vec::from_array(&env, [TransferOp {
+        token: token_addr.clone(),
+        from: admin.clone(),
+        to: recipient.clone(),
+        amount: 300,
+    }]);
+
+    let caller = soroban_sdk::Address::generate(&env);
+    let executed = batch_client.execute_transfers(&caller, &ops);
+    assert_eq!(executed, 1);
+
+    let token_client = soroban_sdk::token::Client::new(&env, &token_addr);
+    assert_eq!(token_client.balance(&recipient), 300);
+    assert_eq!(token_client.balance(&admin), 700);
+}
+
+#[test]
+fn test_execute_transfers_multiple_ops() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let batch_client = setup(&env);
+
+    let admin = soroban_sdk::Address::generate(&env);
+    let bob = soroban_sdk::Address::generate(&env);
+    let carol = soroban_sdk::Address::generate(&env);
+    let token_addr = mint_and_setup_token(&env, &admin, 1000);
+
+    let ops = Vec::from_array(&env, [
+        TransferOp { token: token_addr.clone(), from: admin.clone(), to: bob.clone(), amount: 200 },
+        TransferOp { token: token_addr.clone(), from: admin.clone(), to: carol.clone(), amount: 300 },
+    ]);
+
+    let caller = soroban_sdk::Address::generate(&env);
+    let executed = batch_client.execute_transfers(&caller, &ops);
+    assert_eq!(executed, 2);
+
+    let token_client = soroban_sdk::token::Client::new(&env, &token_addr);
+    assert_eq!(token_client.balance(&bob), 200);
+    assert_eq!(token_client.balance(&carol), 300);
+    assert_eq!(token_client.balance(&admin), 500);
+}
+
+#[test]
+#[should_panic(expected = "empty batch")]
+fn test_execute_transfers_empty_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let batch_client = setup(&env);
+    let caller = soroban_sdk::Address::generate(&env);
+    let ops: Vec<TransferOp> = Vec::new(&env);
+    batch_client.execute_transfers(&caller, &ops);
+}
+
+#[test]
+#[should_panic(expected = "batch exceeds max size of 50")]
+fn test_execute_transfers_over_limit_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let batch_client = setup(&env);
+
+    let admin = soroban_sdk::Address::generate(&env);
+    let token_addr = mint_and_setup_token(&env, &admin, 100_000);
+    let recipient = soroban_sdk::Address::generate(&env);
+
+    let mut ops = Vec::new(&env);
+    for _ in 0..51 {
+        ops.push_back(TransferOp {
+            token: token_addr.clone(),
+            from: admin.clone(),
+            to: recipient.clone(),
+            amount: 1,
+        });
+    }
+
+    let caller = soroban_sdk::Address::generate(&env);
+    batch_client.execute_transfers(&caller, &ops);
+}
+
+#[test]
+#[should_panic(expected = "amount must be positive")]
+fn test_execute_transfers_zero_amount_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let batch_client = setup(&env);
+
+    let admin = soroban_sdk::Address::generate(&env);
+    let token_addr = mint_and_setup_token(&env, &admin, 1000);
+    let recipient = soroban_sdk::Address::generate(&env);
+
+    let ops = Vec::from_array(&env, [TransferOp {
+        token: token_addr.clone(),
+        from: admin.clone(),
+        to: recipient.clone(),
+        amount: 0,
+    }]);
+
+    let caller = soroban_sdk::Address::generate(&env);
+    batch_client.execute_transfers(&caller, &ops);
 }

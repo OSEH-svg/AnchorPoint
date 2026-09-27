@@ -29,6 +29,8 @@ pub struct Grant {
 #[contract]
 pub struct VestingContract;
 
+#[allow(deprecated)]
+#[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl VestingContract {
     /// Initializes the contract with an admin.
@@ -53,6 +55,7 @@ impl VestingContract {
 
     /// Creates a new vesting grant.
     /// The admin must provide the tokens upfront.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_grant(
         env: Env,
         beneficiary: Address,
@@ -76,7 +79,7 @@ impl VestingContract {
 
         // Deposit tokens into the contract
         let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&admin, &env.current_contract_address(), &amount);
+        token_client.transfer(&admin, env.current_contract_address(), &amount);
 
         let id: u32 = env
             .storage()
@@ -97,9 +100,10 @@ impl VestingContract {
         };
 
         env.storage().persistent().set(&DataKey::Grant(id), &grant);
-        env.storage()
-            .instance()
-            .set(&DataKey::GrantCounter, &id.checked_add(1).expect("grant counter overflow"));
+        env.storage().instance().set(
+            &DataKey::GrantCounter,
+            &id.checked_add(1).expect("grant counter overflow"),
+        );
 
         env.events()
             .publish((symbol_short!("grant_new"), id), amount);
@@ -122,7 +126,10 @@ impl VestingContract {
 
         assert!(claimable > 0, "nothing to claim");
 
-        grant.claimed_amount = grant.claimed_amount.checked_add(claimable).expect("claimed overflow");
+        grant.claimed_amount = grant
+            .claimed_amount
+            .checked_add(claimable)
+            .expect("claimed overflow");
         env.storage()
             .persistent()
             .set(&DataKey::Grant(grant_id), &grant);
@@ -154,7 +161,7 @@ impl VestingContract {
             .persistent()
             .get(&DataKey::Grant(grant_id))
             .expect("grant not found");
-        
+
         assert!(grant.revocable, "grant is not revocable");
         assert!(!grant.revoked, "grant is already revoked");
 
@@ -169,8 +176,10 @@ impl VestingContract {
 
         grant.total_amount = vested;
         grant.revoked = true;
-        
-        env.storage().persistent().set(&DataKey::Grant(grant_id), &grant);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Grant(grant_id), &grant);
 
         env.events()
             .publish((symbol_short!("revoked"), grant_id), unvested);
@@ -205,21 +214,39 @@ impl VestingContract {
             return grant.total_amount;
         }
 
-        // Before cliff
-        if current_time < grant.start_time.checked_add(grant.cliff_duration).expect("time overflow") {
+        // 1. Cliff logic check: Calculate cliff_timestamp
+        let cliff_timestamp = grant
+            .start_time
+            .checked_add(grant.cliff_duration)
+            .expect("time overflow");
+
+        // Check current_time < cliff_timestamp: return 0 unlocked tokens.
+        if current_time < cliff_timestamp {
             return 0;
         }
 
-        // After full duration
-        if current_time >= grant.start_time.checked_add(grant.vesting_duration).expect("time overflow") {
+        // 2. Cap logic check: Calculate end_timestamp
+        let end_timestamp = grant
+            .start_time
+            .checked_add(grant.vesting_duration)
+            .expect("time overflow");
+
+        // Cap unlocked amount at total allocated tokens.
+        if current_time >= end_timestamp {
             return grant.total_amount;
         }
 
-        // Linear release
+        // 3. Linear calculation: unlocked = total_amount * (current_time - start_time) / vesting_duration
+        // It is mathematically safe to subtract here because we have already validated
+        // that current_time >= cliff_timestamp, and cliff_timestamp >= start_time.
         let elapsed = (current_time - grant.start_time) as i128;
         let duration = grant.vesting_duration as i128;
 
-        grant.total_amount.checked_mul(elapsed).expect("vesting overflow") / duration
+        grant
+            .total_amount
+            .checked_mul(elapsed)
+            .expect("vesting overflow")
+            / duration
     }
 }
 
@@ -234,14 +261,16 @@ mod tests {
         Address,
         Address,
         Address,
-        token::Client,
-        VestingContractClient,
+        token::Client<'_>,
+        VestingContractClient<'_>,
     ) {
         env.mock_all_auths();
         let admin = Address::generate(env);
         let beneficiary = Address::generate(env);
         let token_admin = Address::generate(env);
-        let token_id = env.register_stellar_asset_contract(token_admin.clone());
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
         let token_client = token::Client::new(env, &token_id);
         let sac_client = token::StellarAssetClient::new(env, &token_id);
 
@@ -264,7 +293,15 @@ mod tests {
         let duration = 1000;
         let amount = 1000;
 
-        let id = client.create_grant(&beneficiary, &token_id, &amount, &start, &cliff, &duration, &false);
+        let id = client.create_grant(
+            &beneficiary,
+            &token_id,
+            &amount,
+            &start,
+            &cliff,
+            &duration,
+            &false,
+        );
 
         // Before cliff
         env.ledger().with_mut(|l| l.timestamp = start + 499);
@@ -285,7 +322,15 @@ mod tests {
         let duration = 1000;
         let amount = 1000;
 
-        let id = client.create_grant(&beneficiary, &token_id, &amount, &start, &cliff, &duration, &false);
+        let id = client.create_grant(
+            &beneficiary,
+            &token_id,
+            &amount,
+            &start,
+            &cliff,
+            &duration,
+            &false,
+        );
 
         // Mid-point
         env.ledger().with_mut(|l| l.timestamp = start + 500);
@@ -312,7 +357,15 @@ mod tests {
         let duration = 1000;
         let amount = 1000;
 
-        let id = client.create_grant(&beneficiary, &token_id, &amount, &start, &cliff, &duration, &true);
+        let id = client.create_grant(
+            &beneficiary,
+            &token_id,
+            &amount,
+            &start,
+            &cliff,
+            &duration,
+            &true,
+        );
 
         // Advance to mid-point
         env.ledger().with_mut(|l| l.timestamp = start + 500);
@@ -343,5 +396,189 @@ mod tests {
         let id = client.create_grant(&beneficiary, &token_id, &1000, &1000, &0, &1000, &false);
         client.revoke_grant(&id);
     }
-}
 
+    /// Verify that nothing is claimable at any point strictly before the cliff.
+    #[test]
+    fn test_cliff_no_tokens_before_cliff() {
+        let env = Env::default();
+        let (_, beneficiary, token_id, _, client) = setup_test(&env);
+
+        let start: u64 = 1000;
+        let cliff: u64 = 600;
+        let duration: u64 = 1000;
+        let amount: i128 = 2000;
+
+        let id = client.create_grant(
+            &beneficiary,
+            &token_id,
+            &amount,
+            &start,
+            &cliff,
+            &duration,
+            &false,
+        );
+
+        // t = start (no time elapsed)
+        env.ledger().with_mut(|l| l.timestamp = start);
+        assert_eq!(client.get_claimable_amount(&id), 0, "should be 0 at start");
+
+        // t = start + cliff - 1 (one second before cliff)
+        env.ledger().with_mut(|l| l.timestamp = start + cliff - 1);
+        assert_eq!(
+            client.get_claimable_amount(&id),
+            0,
+            "should be 0 one second before cliff"
+        );
+    }
+
+    /// Verify linear release between cliff and end, and that claimed tokens
+    /// cannot exceed total_amount.
+    #[test]
+    fn test_cliff_and_post_vesting_payout() {
+        let env = Env::default();
+        let (_, beneficiary, token_id, _, client) = setup_test(&env);
+
+        let start: u64 = 0;
+        let cliff: u64 = 250;
+        let duration: u64 = 1000;
+        let amount: i128 = 1000;
+
+        let id = client.create_grant(
+            &beneficiary,
+            &token_id,
+            &amount,
+            &start,
+            &cliff,
+            &duration,
+            &false,
+        );
+
+        // At the cliff: 250/1000 * 1000 = 250 vested
+        env.ledger().with_mut(|l| l.timestamp = cliff);
+        assert_eq!(client.get_claimable_amount(&id), 250);
+
+        // At 500 (halfway): 500/1000 * 1000 = 500 vested, 250 already claimable
+        env.ledger().with_mut(|l| l.timestamp = 500);
+        assert_eq!(client.get_claimable_amount(&id), 500);
+
+        // Claim 500
+        client.claim(&id);
+        assert_eq!(client.get_claimable_amount(&id), 0);
+
+        // At full duration: entire remaining 500 is claimable
+        env.ledger().with_mut(|l| l.timestamp = duration);
+        assert_eq!(client.get_claimable_amount(&id), 500);
+        client.claim(&id);
+        assert_eq!(client.get_claimable_amount(&id), 0);
+
+        // After full vesting: no more tokens (claimed_amount == total_amount)
+        env.ledger().with_mut(|l| l.timestamp = duration + 999);
+        assert_eq!(client.get_claimable_amount(&id), 0);
+    }
+
+    /// Verify that a zero-cliff grant starts vesting immediately from start_time.
+    #[test]
+    fn test_zero_cliff_vests_immediately() {
+        let env = Env::default();
+        let (_, beneficiary, token_id, _, client) = setup_test(&env);
+
+        let start: u64 = 500;
+        let duration: u64 = 1000;
+        let amount: i128 = 1000;
+
+        let id = client.create_grant(
+            &beneficiary,
+            &token_id,
+            &amount,
+            &start,
+            &0,    // zero cliff
+            &duration,
+            &false,
+        );
+
+        // Any time >= start should yield tokens
+        env.ledger().with_mut(|l| l.timestamp = start + 1);
+        assert!(client.get_claimable_amount(&id) > 0);
+    }
+
+    /// Verify nothing can be claimed before start_time (start_time acts like a cliff of 0).
+    #[test]
+    fn test_nothing_claimable_before_start() {
+        let env = Env::default();
+        let (_, beneficiary, token_id, _, client) = setup_test(&env);
+
+        let start: u64 = 1000;
+        let id = client.create_grant(
+            &beneficiary,
+            &token_id,
+            &500,
+            &start,
+            &0,
+            &500,
+            &false,
+        );
+
+        // Before start
+        env.ledger().with_mut(|l| l.timestamp = start - 1);
+        assert_eq!(client.get_claimable_amount(&id), 0);
+    }
+
+    /// Ensure total claimed never exceeds total_amount even at time far past vesting end.
+    #[test]
+    fn test_total_claimed_cannot_exceed_total_amount() {
+        let env = Env::default();
+        let (_, beneficiary, token_id, token_client, client) = setup_test(&env);
+
+        let start: u64 = 0;
+        let duration: u64 = 1000;
+        let amount: i128 = 1000;
+
+        let id = client.create_grant(
+            &beneficiary,
+            &token_id,
+            &amount,
+            &start,
+            &0,
+            &duration,
+            &false,
+        );
+
+        // Jump to far future
+        env.ledger().with_mut(|l| l.timestamp = duration * 10);
+        client.claim(&id);
+
+        // Balance of beneficiary should equal exactly total_amount
+        assert_eq!(token_client.balance(&beneficiary), amount);
+
+        // No more tokens claimable
+        assert_eq!(client.get_claimable_amount(&id), 0);
+    }
+
+    /// Ensure cliff equal to vesting_duration means all tokens vest at the end.
+    #[test]
+    fn test_cliff_equals_duration_all_at_end() {
+        let env = Env::default();
+        let (_, beneficiary, token_id, _, client) = setup_test(&env);
+
+        let start: u64 = 0;
+        let duration: u64 = 1000;
+
+        let id = client.create_grant(
+            &beneficiary,
+            &token_id,
+            &1000,
+            &start,
+            &duration, // cliff == duration
+            &duration,
+            &false,
+        );
+
+        // Just before end: nothing (cliff not yet reached)
+        env.ledger().with_mut(|l| l.timestamp = duration - 1);
+        assert_eq!(client.get_claimable_amount(&id), 0);
+
+        // At end: full amount
+        env.ledger().with_mut(|l| l.timestamp = duration);
+        assert_eq!(client.get_claimable_amount(&id), 1000);
+    }
+}

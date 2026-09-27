@@ -7,6 +7,7 @@ export interface FeatureFlag {
   description: string;
   rolloutPercentage?: number; // 0-100, for gradual rollout
   targetUsers?: string[]; // User IDs or accounts to target
+  whitelistedUserIds?: string[]; // User IDs to always enable the flag for
   createdAt: Date;
   updatedAt: Date;
 }
@@ -53,6 +54,14 @@ export class FeatureFlagService {
 
       if (!flag.enabled) {
         return false;
+      }
+
+      // Check whitelisted user IDs first
+      if (flag.whitelistedUserIds && flag.whitelistedUserIds.length > 0) {
+        const contextIdentifier = context?.userId || context?.account;
+        if (contextIdentifier && flag.whitelistedUserIds.includes(contextIdentifier)) {
+          return true;
+        }
       }
 
       // Check rollout percentage

@@ -27,13 +27,31 @@ pub enum DataKey {
     Name,
     Symbol,
     Decimals,
+    NativeAsset,
+    Token,
     /// Tracks if an address is authorized to interact with AMM
     AMMAuthorized(Address),
     /// Tracks if an address is authorized to interact with Lending
     LendingAuthorized(Address),
     /// Emergency pause state
     Paused,
+    /// Maximum total supply cap for wrapped tokens
+    MaxSupply,
+    /// Per-account trustline count used when calculating the minimum reserve.
+    /// Stored as u32; defaults to 0 (only the base account reserve applies).
+    TrustlineCount(Address),
 }
+
+// ── Reserve constants ────────────────────────────────────────────────────────
+/// Base reserve per ledger entry in stroops (0.5 XLM = 5_000_000 stroops).
+/// Source: Stellar Core – each account needs at least 2 base reserves (1 XLM)
+/// for the account entry itself, plus 1 base reserve per additional trustline.
+const BASE_RESERVE_STROOPS: i128 = 5_000_000; // 0.5 XLM in stroops (7 decimals)
+
+/// Minimum number of base-reserve entries every account must hold.
+/// An unfunded account requires 2 reserves (the account entry counts as 2).
+const MIN_ACCOUNT_ENTRIES: i128 = 2;
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// XLM Wrapper Contract
 #[contract]
@@ -47,7 +65,9 @@ impl XLMWrapper {
     /// * `admin` - Administrator address with special privileges
     /// * `name` - Token name (e.g., "Wrapped XLM")
     /// * `symbol` - Token symbol (e.g., "wXLM")
-    pub fn initialize(env: Env, admin: Address, name: String, symbol: String) {
+    /// * `token` - Address of the wXLM token contract
+    /// * `native_asset` - Address of the native XLM token contract
+    pub fn initialize(env: Env, admin: Address, token: Address, name: String, symbol: String, native_asset: Address) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("already initialized");
         }
@@ -57,7 +77,9 @@ impl XLMWrapper {
         env.storage().instance().set(&DataKey::Name, &name);
         env.storage().instance().set(&DataKey::Symbol, &symbol);
         env.storage().instance().set(&DataKey::Decimals, &7u32); // XLM uses 7 decimals
+        env.storage().instance().set(&DataKey::Token, &token);
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage().instance().set(&DataKey::NativeAsset, &native_asset);
         
         // Authorize the contract itself for AMM/Lending interactions
         let contract_addr = env.current_contract_address();
@@ -66,31 +88,86 @@ impl XLMWrapper {
     }
 
     /// Deposit native XLM to mint wXLM tokens (1:1 ratio)
-    /// 
+    ///
+    /// Before transferring the XLM this function verifies that the depositor
+    /// will retain at least the Stellar network minimum reserve after the
+    /// deposit.  The minimum reserve is:
+    ///
+    ///   `(MIN_ACCOUNT_ENTRIES + trustline_count) × BASE_RESERVE_STROOPS`
+    ///
+    /// where `BASE_RESERVE_STROOPS` = 5_000_000 (0.5 XLM) and
+    /// `MIN_ACCOUNT_ENTRIES` = 2 (the base account entry requirement).
+    ///
+    /// If the requested `amount` would reduce the account's native XLM balance
+    /// below this threshold the call is rejected with
+    /// `"InsufficientReserve: deposit would violate minimum network reserve"`.
+    ///
     /// # Arguments
-    /// * `from` - Address depositing XLM
-    /// * `amount` - Amount of native XLM to deposit
-    /// 
+    /// * `from`   - Address depositing XLM
+    /// * `amount` - Amount of native XLM (in stroops) to deposit
+    ///
     /// # Returns
-    /// Amount of wXLM minted
+    /// Amount of wXLM minted (always equal to `amount` — 1:1 peg)
     pub fn deposit(env: Env, from: Address, amount: i128) -> i128 {
         from.require_auth();
-        
+
         Self::check_not_paused(&env);
         assert!(amount > 0, "amount must be positive");
-        
-        // Receive native XLM from user
+
+        // ── Minimum reserve check ────────────────────────────────────────────
+        // Fetch the depositor's current native XLM balance before transfer.
+        let native_asset: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::NativeAsset)
+            .expect("native asset not set");
+        let current_balance: i128 =
+            token::Client::new(&env, &native_asset).balance(&from);
+
+        // Additional trustlines held by this account (stored off-chain; default 0).
+        let trustline_count: i128 = env
+            .storage()
+            .instance()
+            .get::<_, u32>(&DataKey::TrustlineCount(from.clone()))
+            .unwrap_or(0) as i128;
+
+        // Minimum balance that must remain after the deposit.
+        let min_reserve: i128 = (MIN_ACCOUNT_ENTRIES + trustline_count)
+            .checked_mul(BASE_RESERVE_STROOPS)
+            .expect("reserve overflow");
+
+        // Available balance is what the account can safely spend without
+        // dropping below the network minimum reserve.
+        let available: i128 = current_balance.saturating_sub(min_reserve);
+
+        if amount > available {
+            panic!(
+                "InsufficientReserve: deposit would violate minimum network reserve \
+                 (available={}, requested={}, min_reserve={})",
+                available, amount, min_reserve
+            );
+        }
+        // ────────────────────────────────────────────────────────────────────
+
+        // Receive native XLM from user (reserve check already passed above).
         let contract_addr = env.current_contract_address();
-        token::StellarAssetClient::new(&env, &contract_addr)
+        token::Client::new(&env, &native_asset)
             .transfer(&from, &contract_addr, &amount);
         
+        // Enforce supply cap if one has been set
+        let supply: i128 = env.storage().instance().get(&DataKey::TotalSupply).unwrap_or(0);
+        if let Some(max_supply) = env.storage().instance().get::<_, i128>(&DataKey::MaxSupply) {
+            if supply.checked_add(amount).unwrap_or(i128::MAX) > max_supply {
+                panic!("SupplyCapExceeded");
+            }
+        }
+
         // Mint wXLM to user (1:1 ratio)
         let bal = Self::balance_of(env.clone(), from.clone());
         env.storage()
             .persistent()
             .set(&DataKey::Balance(from.clone()), &(bal + amount));
-        
-        let supply: i128 = env.storage().instance().get(&DataKey::TotalSupply).unwrap_or(0);
+
         env.storage()
             .instance()
             .set(&DataKey::TotalSupply, &(supply + amount));
@@ -129,8 +206,9 @@ impl XLMWrapper {
             .set(&DataKey::TotalSupply, &(supply - amount));
         
         // Send native XLM back to user
+        let native_asset: Address = env.storage().instance().get(&DataKey::NativeAsset).expect("native asset not set");
         let contract_addr = env.current_contract_address();
-        token::StellarAssetClient::new(&env, &contract_addr)
+        token::Client::new(&env, &native_asset)
             .transfer(&contract_addr, &from, &amount);
         
         env.events()
@@ -159,6 +237,35 @@ impl XLMWrapper {
         );
         env.events()
             .publish((symbol_short!("approve"), owner, spender), amount);
+    }
+
+    /// Decrease the allowance granted to a spender
+    pub fn decrease_allowance(env: Env, owner: Address, spender: Address, amount: i128) {
+        owner.require_auth();
+        assert!(amount >= 0, "amount must be non-negative");
+        let current = Self::allowance(env.clone(), owner.clone(), spender.clone());
+        assert!(amount <= current, "insufficient allowance");
+        let new_allowance = current - amount;
+        env.storage().persistent().set(
+            &DataKey::Allowance(owner.clone(), spender.clone()),
+            &new_allowance,
+        );
+        env.events()
+            .publish((symbol_short!("dec_allow"), owner, spender), new_allowance);
+    }
+
+    /// Increase the allowance granted to a spender
+    pub fn increase_allowance(env: Env, owner: Address, spender: Address, amount: i128) {
+        owner.require_auth();
+        assert!(amount >= 0, "amount must be non-negative");
+        let current = Self::allowance(env.clone(), owner.clone(), spender.clone());
+        let new_allowance = current + amount;
+        env.storage().persistent().set(
+            &DataKey::Allowance(owner.clone(), spender.clone()),
+            &new_allowance,
+        );
+        env.events()
+            .publish((symbol_short!("inc_allow"), owner, spender), new_allowance);
     }
 
     /// Set operator approval for all tokens
@@ -294,7 +401,7 @@ impl XLMWrapper {
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
         assert!(admin == stored_admin, "unauthorized");
         
-        env.storage().instance().set(&DataKey::AMMAuthorized(amm_address), &true);
+        env.storage().instance().set(&DataKey::AMMAuthorized(amm_address.clone()), &true);
         env.events()
             .publish((symbol_short!("amm_auth"), amm_address), true);
     }
@@ -305,9 +412,9 @@ impl XLMWrapper {
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
         assert!(admin == stored_admin, "unauthorized");
         
-        env.storage().instance().remove(&DataKey::AMMAuthorized(amm_address));
+        env.storage().instance().remove(&DataKey::AMMAuthorized(amm_address.clone()));
         env.events()
-            .publish((symbol_short!("amm_revoke"), amm_address), true);
+            .publish((soroban_sdk::Symbol::new(&env, "amm_revoke"), amm_address), true);
     }
 
     /// Check if an address is authorized for AMM interactions
@@ -329,7 +436,7 @@ impl XLMWrapper {
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
         assert!(admin == stored_admin, "unauthorized");
         
-        env.storage().instance().set(&DataKey::LendingAuthorized(lending_address), &true);
+        env.storage().instance().set(&DataKey::LendingAuthorized(lending_address.clone()), &true);
         env.events()
             .publish((symbol_short!("lend_auth"), lending_address), true);
     }
@@ -340,9 +447,9 @@ impl XLMWrapper {
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
         assert!(admin == stored_admin, "unauthorized");
         
-        env.storage().instance().remove(&DataKey::LendingAuthorized(lending_address));
+        env.storage().instance().remove(&DataKey::LendingAuthorized(lending_address.clone()));
         env.events()
-            .publish((symbol_short!("lend_revoke"), lending_address), true);
+            .publish((soroban_sdk::Symbol::new(&env, "lend_revoke"), lending_address.clone()), true);
     }
 
     /// Check if an address is authorized for Lending interactions
@@ -356,6 +463,84 @@ impl XLMWrapper {
     // ============================================================================
     // Admin Functions
     // ============================================================================
+
+    /// Record the number of non-native trustlines held by an account so that
+    /// the reserve calculation inside `deposit` can account for them.
+    ///
+    /// In production this is typically called by a trusted oracle / relayer
+    /// whenever an account's trustline set changes.  Only the admin may call
+    /// this to prevent manipulation.
+    ///
+    /// # Arguments
+    /// * `admin`           - Administrator address
+    /// * `account`         - The account whose trustline count is being updated
+    /// * `trustline_count` - Number of non-native trustlines (≥ 0)
+    pub fn set_trustline_count(
+        env: Env,
+        admin: Address,
+        account: Address,
+        trustline_count: u32,
+    ) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("admin not set");
+        assert!(admin == stored_admin, "unauthorized");
+
+        env.storage()
+            .instance()
+            .set(&DataKey::TrustlineCount(account.clone()), &trustline_count);
+
+        env.events()
+            .publish((symbol_short!("tl_count"), account), trustline_count);
+    }
+
+    /// Return the minimum XLM reserve (in stroops) that must remain in an
+    /// account after a deposit, given the stored trustline count.
+    ///
+    /// # Arguments
+    /// * `account` - The account to query
+    pub fn get_min_reserve(env: Env, account: Address) -> i128 {
+        let trustline_count: i128 = env
+            .storage()
+            .instance()
+            .get::<_, u32>(&DataKey::TrustlineCount(account))
+            .unwrap_or(0) as i128;
+        (MIN_ACCOUNT_ENTRIES + trustline_count)
+            .checked_mul(BASE_RESERVE_STROOPS)
+            .expect("reserve overflow")
+    }
+
+    /// Set maximum total supply cap for wrapped tokens
+    /// Pass `0` to remove the cap entirely.
+    ///
+    /// # Arguments
+    /// * `admin` - Administrator address
+    /// * `max_supply` - New cap; set to 0 to disable
+    pub fn set_max_supply(env: Env, admin: Address, max_supply: i128) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
+        assert!(admin == stored_admin, "unauthorized");
+        assert!(max_supply >= 0, "max_supply must be non-negative");
+
+        if max_supply == 0 {
+            env.storage().instance().remove(&DataKey::MaxSupply);
+        } else {
+            env.storage().instance().set(&DataKey::MaxSupply, &max_supply);
+        }
+        env.events()
+            .publish((symbol_short!("set_cap"), admin), max_supply);
+    }
+
+    /// Return current supply cap; returns 0 when no cap is set.
+    pub fn get_max_supply(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxSupply)
+            .unwrap_or(0)
+    }
 
     /// Pause deposits and withdrawals (emergency function)
     pub fn pause(env: Env, admin: Address) {
@@ -427,196 +612,481 @@ impl XLMWrapper {
 mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::token::StellarAssetClient;
 
-    fn setup() -> (Env, XLMWrapperClient<'static>, Address) {
+    struct TestEnv {
+        env: Env,
+        client: XLMWrapperClient<'static>,
+        sac: StellarAssetClient<'static>,
+        admin: Address,
+    }
+
+    fn setup() -> TestEnv {
         let env = Env::default();
         env.mock_all_auths();
         
         let admin = Address::generate(&env);
+        let sac_contract = env.register_stellar_asset_contract_v2(admin.clone());
+        let native_asset = sac_contract.address();
+        let sac = StellarAssetClient::new(&env, &native_asset);
+        
         let contract_id = env.register_contract(None, XLMWrapper);
         let client = XLMWrapperClient::new(&env, &contract_id);
         
+        let token = Address::generate(&env);
         client.initialize(
             &admin,
+            &token,
             &String::from_str(&env, "Wrapped XLM"),
             &String::from_str(&env, "wXLM"),
+            &native_asset,
         );
         
-        (env, client, admin)
+        TestEnv { env, client, sac, admin }
+    }
+
+    fn fund_user(te: &TestEnv, user: &Address, amount: i128) {
+        // Mint enough to cover the deposit PLUS the mandatory 2-entry base
+        // reserve (2 × 5_000_000 = 10_000_000 stroops) so that the minimum-
+        // reserve check inside deposit() does not reject the call.
+        te.sac.mint(user, &(amount + 10_000_000));
     }
 
     #[test]
     fn test_initialize() {
-        let (env, client, admin) = setup();
+        let te = setup();
         
-        assert_eq!(client.name(), String::from_str(&env, "Wrapped XLM"));
-        assert_eq!(client.symbol(), String::from_str(&env, "wXLM"));
-        assert_eq!(client.decimals(), 7);
-        assert_eq!(client.total_supply(), 0);
+        assert_eq!(te.client.name(), String::from_str(&te.env, "Wrapped XLM"));
+        assert_eq!(te.client.symbol(), String::from_str(&te.env, "wXLM"));
+        assert_eq!(te.client.decimals(), 7);
+        assert_eq!(te.client.total_supply(), 0);
     }
 
     #[test]
     fn test_deposit_withdraw() {
-        let (env, client, admin) = setup();
-        let user = Address::generate(&env);
+        let te = setup();
+        let user = Address::generate(&te.env);
         
-        // Mock native XLM balance for testing
-        // In production, this would be actual native XLM
+        fund_user(&te, &user, 1000);
+        te.client.deposit(&user, &1000);
         
-        // Test deposit
-        let deposit_amount = 1000_i128;
-        client.deposit(&user, &deposit_amount);
+        assert_eq!(te.client.balance_of(&user), 1000);
+        assert_eq!(te.client.total_supply(), 1000);
         
-        assert_eq!(client.balance_of(&user), deposit_amount);
-        assert_eq!(client.total_supply(), deposit_amount);
+        te.client.withdraw(&user, &500);
         
-        // Test withdraw
-        let withdraw_amount = 500_i128;
-        client.withdraw(&user, &withdraw_amount);
-        
-        assert_eq!(client.balance_of(&user), deposit_amount - withdraw_amount);
-        assert_eq!(client.total_supply(), deposit_amount - withdraw_amount);
+        assert_eq!(te.client.balance_of(&user), 500);
+        assert_eq!(te.client.total_supply(), 500);
     }
 
     #[test]
     fn test_transfer() {
-        let (env, client, admin) = setup();
-        let alice = Address::generate(&env);
-        let bob = Address::generate(&env);
+        let te = setup();
+        let alice = Address::generate(&te.env);
+        let bob = Address::generate(&te.env);
         
-        client.deposit(&alice, &1000);
-        client.transfer(&alice, &bob, &300);
+        fund_user(&te, &alice, 1000);
+        te.client.deposit(&alice, &1000);
+        te.client.transfer(&alice, &bob, &300);
         
-        assert_eq!(client.balance_of(&alice), 700);
-        assert_eq!(client.balance_of(&bob), 300);
-        assert_eq!(client.total_supply(), 1000);
+        assert_eq!(te.client.balance_of(&alice), 700);
+        assert_eq!(te.client.balance_of(&bob), 300);
+        assert_eq!(te.client.total_supply(), 1000);
     }
 
     #[test]
     fn test_approve_and_transfer_from() {
-        let (env, client, admin) = setup();
-        let alice = Address::generate(&env);
-        let bob = Address::generate(&env);
-        let carol = Address::generate(&env);
+        let te = setup();
+        let alice = Address::generate(&te.env);
+        let bob = Address::generate(&te.env);
+        let carol = Address::generate(&te.env);
         
-        client.deposit(&alice, &1000);
-        client.approve(&alice, &bob, &500);
+        fund_user(&te, &alice, 1000);
+        te.client.deposit(&alice, &1000);
+        te.client.approve(&alice, &bob, &500);
         
-        assert_eq!(client.allowance(&alice, &bob), 500);
+        assert_eq!(te.client.allowance(&alice, &bob), 500);
         
-        client.transfer_from(&bob, &alice, &carol, &300);
+        te.client.transfer_from(&bob, &alice, &carol, &300);
         
-        assert_eq!(client.balance_of(&alice), 700);
-        assert_eq!(client.balance_of(&carol), 300);
-        assert_eq!(client.allowance(&alice, &bob), 200);
+        assert_eq!(te.client.balance_of(&alice), 700);
+        assert_eq!(te.client.balance_of(&carol), 300);
+        assert_eq!(te.client.allowance(&alice, &bob), 200);
+    }
+
+    #[test]
+    fn test_decrease_allowance() {
+        let te = setup();
+        let owner = Address::generate(&te.env);
+        let spender = Address::generate(&te.env);
+
+        fund_user(&te, &owner, 1000);
+        te.client.deposit(&owner, &1000);
+        te.client.approve(&owner, &spender, &500);
+
+        assert_eq!(te.client.allowance(&owner, &spender), 500);
+
+        te.client.decrease_allowance(&owner, &spender, &200);
+
+        assert_eq!(te.client.allowance(&owner, &spender), 300);
+    }
+
+    #[test]
+    fn test_decrease_allowance_to_zero() {
+        let te = setup();
+        let owner = Address::generate(&te.env);
+        let spender = Address::generate(&te.env);
+
+        fund_user(&te, &owner, 1000);
+        te.client.deposit(&owner, &1000);
+        te.client.approve(&owner, &spender, &300);
+        te.client.decrease_allowance(&owner, &spender, &300);
+
+        assert_eq!(te.client.allowance(&owner, &spender), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "insufficient allowance")]
+    fn test_decrease_allowance_exceeding_balance() {
+        let te = setup();
+        let owner = Address::generate(&te.env);
+        let spender = Address::generate(&te.env);
+
+        fund_user(&te, &owner, 1000);
+        te.client.deposit(&owner, &1000);
+        te.client.approve(&owner, &spender, &300);
+        te.client.decrease_allowance(&owner, &spender, &500);
+    }
+
+    #[test]
+    #[should_panic(expected = "insufficient allowance")]
+    fn test_decrease_allowance_from_zero() {
+        let te = setup();
+        let owner = Address::generate(&te.env);
+        let spender = Address::generate(&te.env);
+
+        fund_user(&te, &owner, 1000);
+        te.client.deposit(&owner, &1000);
+
+        // Decreasing from zero allowance should fail
+        te.client.decrease_allowance(&owner, &spender, &100);
+    }
+
+    #[test]
+    fn test_increase_allowance() {
+        let te = setup();
+        let owner = Address::generate(&te.env);
+        let spender = Address::generate(&te.env);
+
+        fund_user(&te, &owner, 1000);
+        te.client.deposit(&owner, &1000);
+        te.client.approve(&owner, &spender, &300);
+
+        assert_eq!(te.client.allowance(&owner, &spender), 300);
+
+        te.client.increase_allowance(&owner, &spender, &200);
+
+        assert_eq!(te.client.allowance(&owner, &spender), 500);
+    }
+
+    #[test]
+    fn test_increase_allowance_from_zero() {
+        let te = setup();
+        let owner = Address::generate(&te.env);
+        let spender = Address::generate(&te.env);
+
+        fund_user(&te, &owner, 1000);
+        te.client.deposit(&owner, &1000);
+
+        te.client.increase_allowance(&owner, &spender, &300);
+
+        assert_eq!(te.client.allowance(&owner, &spender), 300);
+    }
+
+    #[test]
+    #[should_panic(expected = "amount must be non-negative")]
+    fn test_decrease_allowance_negative_amount() {
+        let te = setup();
+        let owner = Address::generate(&te.env);
+        let spender = Address::generate(&te.env);
+
+        fund_user(&te, &owner, 1000);
+        te.client.deposit(&owner, &1000);
+        te.client.approve(&owner, &spender, &500);
+        te.client.decrease_allowance(&owner, &spender, &-100);
+    }
+
+    #[test]
+    fn test_allowance_combined_operations() {
+        let te = setup();
+        let owner = Address::generate(&te.env);
+        let spender = Address::generate(&te.env);
+
+        fund_user(&te, &owner, 1000);
+        te.client.deposit(&owner, &1000);
+
+        // Approve, then increase, then decrease, then transfer_from
+        te.client.approve(&owner, &spender, &200);
+        assert_eq!(te.client.allowance(&owner, &spender), 200);
+
+        te.client.increase_allowance(&owner, &spender, &100);
+        assert_eq!(te.client.allowance(&owner, &spender), 300);
+
+        te.client.decrease_allowance(&owner, &spender, &50);
+        assert_eq!(te.client.allowance(&owner, &spender), 250);
+
+        let recipient = Address::generate(&te.env);
+        te.client.transfer_from(&spender, &owner, &recipient, &100);
+        assert_eq!(te.client.allowance(&owner, &spender), 150);
+        assert_eq!(te.client.balance_of(&owner), 900);
+        assert_eq!(te.client.balance_of(&recipient), 100);
     }
 
     #[test]
     fn test_operator_approval() {
-        let (env, client, admin) = setup();
-        let alice = Address::generate(&env);
-        let operator = Address::generate(&env);
-        let bob = Address::generate(&env);
+        let te = setup();
+        let alice = Address::generate(&te.env);
+        let operator = Address::generate(&te.env);
+        let bob = Address::generate(&te.env);
         
-        client.deposit(&alice, &1000);
-        client.set_approval_for_all(&alice, &operator, &true);
+        fund_user(&te, &alice, 1000);
+        te.client.deposit(&alice, &1000);
+        te.client.set_approval_for_all(&alice, &operator, &true);
         
-        assert!(client.is_approved_for_all(&alice, &operator));
+        assert!(te.client.is_approved_for_all(&alice, &operator));
         
-        client.transfer_from(&operator, &alice, &bob, &300);
+        te.client.transfer_from(&operator, &alice, &bob, &300);
         
-        assert_eq!(client.balance_of(&alice), 700);
-        assert_eq!(client.balance_of(&bob), 300);
+        assert_eq!(te.client.balance_of(&alice), 700);
+        assert_eq!(te.client.balance_of(&bob), 300);
     }
 
     #[test]
     fn test_burn() {
-        let (env, client, admin) = setup();
-        let alice = Address::generate(&env);
+        let te = setup();
+        let alice = Address::generate(&te.env);
         
-        client.deposit(&alice, &1000);
-        client.burn(&alice, &300);
+        fund_user(&te, &alice, 1000);
+        te.client.deposit(&alice, &1000);
+        te.client.burn(&alice, &300);
         
-        assert_eq!(client.balance_of(&alice), 700);
-        assert_eq!(client.total_supply(), 700);
+        assert_eq!(te.client.balance_of(&alice), 700);
+        assert_eq!(te.client.total_supply(), 700);
     }
 
     #[test]
     fn test_amm_authorization() {
-        let (env, client, admin) = setup();
-        let amm_address = Address::generate(&env);
+        let te = setup();
+        let amm_address = Address::generate(&te.env);
         
-        assert!(!client.is_amm_authorized(&amm_address));
+        assert!(!te.client.is_amm_authorized(&amm_address));
         
-        client.authorize_amm(&admin, &amm_address);
-        assert!(client.is_amm_authorized(&amm_address));
+        te.client.authorize_amm(&te.admin, &amm_address);
+        assert!(te.client.is_amm_authorized(&amm_address));
         
-        client.revoke_amm(&admin, &amm_address);
-        assert!(!client.is_amm_authorized(&amm_address));
+        te.client.revoke_amm(&te.admin, &amm_address);
+        assert!(!te.client.is_amm_authorized(&amm_address));
     }
 
     #[test]
     fn test_lending_authorization() {
-        let (env, client, admin) = setup();
-        let lending_address = Address::generate(&env);
+        let te = setup();
+        let lending_address = Address::generate(&te.env);
         
-        assert!(!client.is_lending_authorized(&lending_address));
+        assert!(!te.client.is_lending_authorized(&lending_address));
         
-        client.authorize_lending(&admin, &lending_address);
-        assert!(client.is_lending_authorized(&lending_address));
+        te.client.authorize_lending(&te.admin, &lending_address);
+        assert!(te.client.is_lending_authorized(&lending_address));
         
-        client.revoke_lending(&admin, &lending_address);
-        assert!(!client.is_lending_authorized(&lending_address));
+        te.client.revoke_lending(&te.admin, &lending_address);
+        assert!(!te.client.is_lending_authorized(&lending_address));
     }
 
     #[test]
     fn test_pause_unpause() {
-        let (env, client, admin) = setup();
-        let user = Address::generate(&env);
+        let te = setup();
+        let user = Address::generate(&te.env);
         
-        assert!(!client.is_paused());
+        assert!(!te.client.is_paused());
         
-        client.pause(&admin);
-        assert!(client.is_paused());
+        te.client.pause(&te.admin);
+        assert!(te.client.is_paused());
         
-        client.unpause(&admin);
-        assert!(!client.is_paused());
+        te.client.unpause(&te.admin);
+        assert!(!te.client.is_paused());
     }
 
     #[test]
     #[should_panic(expected = "contract is paused")]
     fn test_deposit_when_paused() {
-        let (env, client, admin) = setup();
-        let user = Address::generate(&env);
+        let te = setup();
+        let user = Address::generate(&te.env);
         
-        client.pause(&admin);
-        client.deposit(&user, &1000);
+        te.client.pause(&te.admin);
+        // The paused check fires before the reserve check, so any amount works.
+        te.client.deposit(&user, &1000);
     }
 
     #[test]
     #[should_panic(expected = "contract is paused")]
     fn test_withdraw_when_paused() {
-        let (env, client, admin) = setup();
-        let user = Address::generate(&env);
+        let te = setup();
+        let user = Address::generate(&te.env);
         
-        client.deposit(&user, &1000);
-        client.pause(&admin);
-        client.withdraw(&user, &500);
+        fund_user(&te, &user, 1000);
+        te.client.deposit(&user, &1000);
+        te.client.pause(&te.admin);
+        te.client.withdraw(&user, &500);
+    }
+
+    #[test]
+    fn test_set_and_get_max_supply() {
+        let te = setup();
+        assert_eq!(te.client.get_max_supply(), 0);
+        te.client.set_max_supply(&te.admin, &5000);
+        assert_eq!(te.client.get_max_supply(), 5000);
+    }
+
+    #[test]
+    fn test_deposit_within_cap() {
+        let te = setup();
+        te.client.set_max_supply(&te.admin, &2000);
+        let user = Address::generate(&te.env);
+        fund_user(&te, &user, 2000);
+        te.client.deposit(&user, &2000);
+        assert_eq!(te.client.total_supply(), 2000);
+    }
+
+    #[test]
+    #[should_panic(expected = "SupplyCapExceeded")]
+    fn test_deposit_exceeds_cap_panics() {
+        let te = setup();
+        te.client.set_max_supply(&te.admin, &500);
+        let user = Address::generate(&te.env);
+        fund_user(&te, &user, 1000);
+        te.client.deposit(&user, &1000);
+    }
+
+    #[test]
+    fn test_remove_cap_by_setting_zero() {
+        let te = setup();
+        te.client.set_max_supply(&te.admin, &500);
+        assert_eq!(te.client.get_max_supply(), 500);
+        te.client.set_max_supply(&te.admin, &0);
+        assert_eq!(te.client.get_max_supply(), 0);
+        // Deposit should now succeed without cap enforcement
+        let user = Address::generate(&te.env);
+        fund_user(&te, &user, 1000);
+        te.client.deposit(&user, &1000);
+        assert_eq!(te.client.total_supply(), 1000);
     }
 
     #[test]
     fn test_one_to_one_peg() {
-        let (env, client, admin) = setup();
-        let user = Address::generate(&env);
+        let te = setup();
+        let user = Address::generate(&te.env);
         
         // Verify 1:1 peg is maintained
-        client.deposit(&user, &1000);
-        assert_eq!(client.balance_of(&user), 1000);
-        assert_eq!(client.total_supply(), 1000);
+        fund_user(&te, &user, 1000);
+        te.client.deposit(&user, &1000);
+        assert_eq!(te.client.balance_of(&user), 1000);
+        assert_eq!(te.client.total_supply(), 1000);
         
-        client.withdraw(&user, &1000);
-        assert_eq!(client.balance_of(&user), 0);
-        assert_eq!(client.total_supply(), 0);
+        te.client.withdraw(&user, &1000);
+        assert_eq!(te.client.balance_of(&user), 0);
+        assert_eq!(te.client.total_supply(), 0);
+    }
+
+    // ── Minimum reserve tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_deposit_respects_base_reserve() {
+        // BASE RESERVE = 2 × 5_000_000 = 10_000_000 stroops (1 XLM).
+        // Fund the user with exactly 1 XLM above the reserve so a deposit
+        // of that 1 XLM should succeed while a deposit of 1 stroop more fails.
+        let te = setup();
+        let user = Address::generate(&te.env);
+
+        // Fund with 20_000_000 (2 XLM).  Reserve = 10_000_000.  Available = 10_000_000.
+        fund_user(&te, &user, 20_000_000);
+
+        // Depositing exactly the available 10_000_000 stroops must succeed.
+        te.client.deposit(&user, &10_000_000);
+        assert_eq!(te.client.balance_of(&user), 10_000_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "InsufficientReserve")]
+    fn test_deposit_below_base_reserve_rejected() {
+        // Fund the user with exactly the minimum reserve (10_000_000) so
+        // they have zero available to deposit — any positive deposit must fail.
+        let te = setup();
+        let user = Address::generate(&te.env);
+
+        // Fund with exactly the base reserve amount.
+        fund_user(&te, &user, 10_000_000);
+
+        // Attempting to deposit 1 stroop would drop balance below min reserve.
+        te.client.deposit(&user, &1);
+    }
+
+    #[test]
+    #[should_panic(expected = "InsufficientReserve")]
+    fn test_deposit_exceeding_available_balance_rejected() {
+        // User has 15_000_000 stroops.  Reserve = 10_000_000.  Available = 5_000_000.
+        // Depositing 5_000_001 must fail.
+        let te = setup();
+        let user = Address::generate(&te.env);
+
+        fund_user(&te, &user, 15_000_000);
+        te.client.deposit(&user, &5_000_001);
+    }
+
+    #[test]
+    fn test_get_min_reserve_default() {
+        // Without any trustlines the minimum reserve should be
+        // 2 × BASE_RESERVE = 10_000_000 stroops.
+        let te = setup();
+        let user = Address::generate(&te.env);
+        assert_eq!(te.client.get_min_reserve(&user), 10_000_000);
+    }
+
+    #[test]
+    fn test_get_min_reserve_with_trustlines() {
+        // With 3 trustlines: (2 + 3) × 5_000_000 = 25_000_000 stroops.
+        let te = setup();
+        let user = Address::generate(&te.env);
+
+        te.client.set_trustline_count(&te.admin, &user, &3u32);
+        assert_eq!(te.client.get_min_reserve(&user), 25_000_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "InsufficientReserve")]
+    fn test_deposit_with_trustlines_enforces_higher_reserve() {
+        // Account has 3 trustlines: reserve = (2+3)×5_000_000 = 25_000_000.
+        // Fund with 30_000_000 → available = 5_000_000.
+        // Depositing 5_000_001 must fail.
+        let te = setup();
+        let user = Address::generate(&te.env);
+
+        te.client.set_trustline_count(&te.admin, &user, &3u32);
+        fund_user(&te, &user, 30_000_000);
+        te.client.deposit(&user, &5_000_001);
+    }
+
+    #[test]
+    fn test_deposit_with_trustlines_within_available() {
+        // Account has 2 trustlines: reserve = (2+2)×5_000_000 = 20_000_000.
+        // Fund with 30_000_000 → available = 10_000_000.
+        // Depositing exactly 10_000_000 must succeed.
+        let te = setup();
+        let user = Address::generate(&te.env);
+
+        te.client.set_trustline_count(&te.admin, &user, &2u32);
+        fund_user(&te, &user, 30_000_000);
+        te.client.deposit(&user, &10_000_000);
+        assert_eq!(te.client.balance_of(&user), 10_000_000);
     }
 }
 
@@ -631,23 +1101,39 @@ mod invariants {
     extern crate std;
     use super::*;
     use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::token::StellarAssetClient;
 
-    /// Helper to set up a fresh contract instance
-    fn setup_fresh() -> (Env, XLMWrapperClient<'static>, Address) {
+    fn fund_user(env: &Env, sac: &StellarAssetClient<'_>, user: &Address, amount: i128) {
+        // Always mint amount + base reserve (10_000_000 stroops) so that the
+        // minimum-reserve guard inside deposit() does not reject the call.
+        sac.mint(user, &(amount + 10_000_000));
+    }
+
+    fn fund_and_deposit(env: &Env, sac: &StellarAssetClient<'_>, client: &XLMWrapperClient<'_>, user: &Address, amount: i128) {
+        fund_user(env, sac, user, amount);
+        client.deposit(user, &amount);
+    }
+
+    fn setup_fresh() -> (Env, XLMWrapperClient<'static>, StellarAssetClient<'static>, Address) {
         let env = Env::default();
         env.mock_all_auths();
         let admin = Address::generate(&env);
+        let sac_contract = env.register_stellar_asset_contract_v2(admin.clone());
+        let native_asset = sac_contract.address();
+        let sac = StellarAssetClient::new(&env, &native_asset);
         let contract_id = env.register_contract(None, XLMWrapper);
         let client = XLMWrapperClient::new(&env, &contract_id);
+        let token = Address::generate(&env);
         client.initialize(
             &admin,
+            &token,
             &String::from_str(&env, "Wrapped XLM"),
             &String::from_str(&env, "wXLM"),
+            &native_asset,
         );
-        (env, client, admin)
+        (env, client, sac, admin)
     }
 
-    /// Helper to verify the supply conservation invariant
     fn verify_supply_conservation(env: &Env, client: &XLMWrapperClient<'_>, users: &[Address]) {
         let total_supply = client.total_supply();
         let balance_sum: i128 = users.iter().map(|u| client.balance_of(u)).sum();
@@ -658,458 +1144,338 @@ mod invariants {
         );
     }
 
-    // =========================================================================
-    // INVARIANT 1: Conservation of Supply
-    // =========================================================================
-    /// After any operation, the sum of all user balances must equal total_supply.
-    /// This is the fundamental invariant of any token contract.
     #[test]
     fn invariant_supply_conservation_after_deposit() {
-        let (env, client, _) = setup_fresh();
+        let (env, client, sac, _) = setup_fresh();
         let user1 = Address::generate(&env);
         let user2 = Address::generate(&env);
         let user3 = Address::generate(&env);
-
-        // Deposit to multiple users
-        client.deposit(&user1, &1000);
+        fund_and_deposit(&env, &sac, &client, &user1, 1000);
         verify_supply_conservation(&env, &client, &[user1.clone(), user2.clone(), user3.clone()]);
-
-        client.deposit(&user2, &500);
+        fund_and_deposit(&env, &sac, &client, &user2, 500);
         verify_supply_conservation(&env, &client, &[user1.clone(), user2.clone(), user3.clone()]);
-
-        client.deposit(&user3, &250);
+        fund_and_deposit(&env, &sac, &client, &user3, 250);
         verify_supply_conservation(&env, &client, &[user1, user2, user3]);
     }
 
     #[test]
     fn invariant_supply_conservation_after_transfer() {
-        let (env, client, _) = setup_fresh();
+        let (env, client, sac, _) = setup_fresh();
         let alice = Address::generate(&env);
         let bob = Address::generate(&env);
         let carol = Address::generate(&env);
-
-        client.deposit(&alice, &1000);
+        fund_and_deposit(&env, &sac, &client, &alice, 1000);
         let supply_before = client.total_supply();
-
-        // Multiple transfers
         client.transfer(&alice, &bob, &300);
         verify_supply_conservation(&env, &client, &[alice.clone(), bob.clone(), carol.clone()]);
-
         client.transfer(&bob, &carol, &150);
         verify_supply_conservation(&env, &client, &[alice.clone(), bob.clone(), carol.clone()]);
-
         client.transfer(&alice, &carol, &100);
         verify_supply_conservation(&env, &client, &[alice, bob, carol]);
-
         let supply_after = client.total_supply();
-        assert_eq!(
-            supply_before, supply_after,
-            "INVARIANT VIOLATION: Supply changed during transfers"
-        );
+        assert_eq!(supply_before, supply_after, "INVARIANT VIOLATION: Supply changed during transfers");
     }
 
     #[test]
     fn invariant_supply_conservation_after_withdraw() {
-        let (env, client, _) = setup_fresh();
+        let (env, client, sac, _) = setup_fresh();
         let user = Address::generate(&env);
-
-        client.deposit(&user, &1000);
+        fund_and_deposit(&env, &sac, &client, &user, 1000);
         let supply_before_withdraw = client.total_supply();
-
         client.withdraw(&user, &300);
         verify_supply_conservation(&env, &client, &[user.clone()]);
-
-        // Invariant: supply decreases by exactly the withdrawn amount
-        assert_eq!(
-            client.total_supply(),
-            supply_before_withdraw - 300,
-            "INVARIANT VIOLATION: Supply not reduced correctly after withdraw"
-        );
-
+        assert_eq!(client.total_supply(), supply_before_withdraw - 300, "INVARIANT VIOLATION: Supply not reduced correctly after withdraw");
         verify_supply_conservation(&env, &client, &[user]);
     }
 
     #[test]
     fn invariant_supply_conservation_after_burn() {
-        let (env, client, _) = setup_fresh();
+        let (env, client, sac, _) = setup_fresh();
         let user = Address::generate(&env);
-
-        client.deposit(&user, &1000);
+        fund_and_deposit(&env, &sac, &client, &user, 1000);
         let supply_before_burn = client.total_supply();
-
         client.burn(&user, &300);
         verify_supply_conservation(&env, &client, &[user.clone()]);
-
-        assert_eq!(
-            client.total_supply(),
-            supply_before_burn - 300,
-            "INVARIANT VIOLATION: Supply not reduced correctly after burn"
-        );
-
+        assert_eq!(client.total_supply(), supply_before_burn - 300, "INVARIANT VIOLATION: Supply not reduced correctly after burn");
         verify_supply_conservation(&env, &client, &[user]);
     }
 
-    // =========================================================================
-    // INVARIANT 2: 1:1 Peg Maintenance
-    // =========================================================================
-    /// The total supply of wXLM should always equal the total amount of
-    /// native XLM held by the contract (minus any burned tokens).
     #[test]
     fn invariant_one_to_one_peg_after_operations() {
-        let (env, client, _) = setup_fresh();
+        let (env, client, sac, _) = setup_fresh();
         let user = Address::generate(&env);
-
-        // Deposit creates 1:1 peg
-        client.deposit(&user, &1000);
-        assert_eq!(
-            client.total_supply(),
-            client.balance_of(&user),
-            "INVARIANT VIOLATION: 1:1 peg broken after deposit"
-        );
-
-        // Transfer maintains peg
+        fund_and_deposit(&env, &sac, &client, &user, 1000);
+        assert_eq!(client.total_supply(), client.balance_of(&user), "INVARIANT VIOLATION: 1:1 peg broken after deposit");
         let bob = Address::generate(&env);
         client.transfer(&user, &bob, &300);
-        assert_eq!(
-            client.total_supply(),
-            client.balance_of(&user) + client.balance_of(&bob),
-            "INVARIANT VIOLATION: 1:1 peg broken after transfer"
-        );
-
-        // Withdraw maintains peg
+        assert_eq!(client.total_supply(), client.balance_of(&user) + client.balance_of(&bob), "INVARIANT VIOLATION: 1:1 peg broken after transfer");
         client.withdraw(&user, &200);
-        assert_eq!(
-            client.total_supply(),
-            client.balance_of(&user) + client.balance_of(&bob),
-            "INVARIANT VIOLATION: 1:1 peg broken after withdraw"
-        );
+        assert_eq!(client.total_supply(), client.balance_of(&user) + client.balance_of(&bob), "INVARIANT VIOLATION: 1:1 peg broken after withdraw");
     }
 
-    // =========================================================================
-    // INVARIANT 3: Non-Negative Balances
-    // =========================================================================
-    /// All balances must always be non-negative (>= 0).
     #[test]
     fn invariant_non_negative_balances() {
-        let (env, client, _) = setup_fresh();
+        let (env, client, sac, _) = setup_fresh();
         let user = Address::generate(&env);
-
-        assert!(
-            client.balance_of(&user) >= 0,
-            "INVARIANT VIOLATION: Initial balance is negative"
-        );
-
-        client.deposit(&user, &100);
-        assert!(
-            client.balance_of(&user) >= 0,
-            "INVARIANT VIOLATION: Balance negative after deposit"
-        );
-
+        assert!(client.balance_of(&user) >= 0, "INVARIANT VIOLATION: Initial balance is negative");
+        fund_and_deposit(&env, &sac, &client, &user, 100);
+        assert!(client.balance_of(&user) >= 0, "INVARIANT VIOLATION: Balance negative after deposit");
         client.withdraw(&user, &100);
-        assert!(
-            client.balance_of(&user) >= 0,
-            "INVARIANT VIOLATION: Balance negative after withdraw"
-        );
+        assert!(client.balance_of(&user) >= 0, "INVARIANT VIOLATION: Balance negative after withdraw");
     }
 
-    // =========================================================================
-    // INVARIANT 4: Conservation of Value in Transfer
-    // =========================================================================
-    /// In any transfer, the sum of sender and receiver balances before
-    /// must equal the sum after the transfer.
     #[test]
     fn invariant_transfer_value_conservation() {
-        let (env, client, _) = setup_fresh();
+        let (env, client, sac, _) = setup_fresh();
         let alice = Address::generate(&env);
         let bob = Address::generate(&env);
-
-        client.deposit(&alice, &1000);
-
+        fund_and_deposit(&env, &sac, &client, &alice, 1000);
         let alice_before = client.balance_of(&alice);
         let bob_before = client.balance_of(&bob);
         let sum_before = alice_before + bob_before;
-
         client.transfer(&alice, &bob, &400);
-
         let alice_after = client.balance_of(&alice);
         let bob_after = client.balance_of(&bob);
         let sum_after = alice_after + bob_after;
-
-        assert_eq!(
-            sum_before, sum_after,
-            "INVARIANT VIOLATION: Value not conserved in transfer"
-        );
-
-        assert_eq!(
-            alice_before - alice_after,
-            400,
-            "INVARIANT VIOLATION: Sender balance not reduced correctly"
-        );
-
-        assert_eq!(
-            bob_after - bob_before,
-            400,
-            "INVARIANT VIOLATION: Receiver balance not increased correctly"
-        );
+        assert_eq!(sum_before, sum_after, "INVARIANT VIOLATION: Value not conserved in transfer");
+        assert_eq!(alice_before - alice_after, 400, "INVARIANT VIOLATION: Sender balance not reduced correctly");
+        assert_eq!(bob_after - bob_before, 400, "INVARIANT VIOLATION: Receiver balance not increased correctly");
     }
 
-    // =========================================================================
-    // INVARIANT 5: Allowance Accounting
-    // =========================================================================
-    /// After transfer_from, the allowance must decrease by exactly the
-    /// transferred amount.
     #[test]
     fn invariant_allowance_decrease_on_transfer_from() {
-        let (env, client, _) = setup_fresh();
+        let (env, client, sac, _) = setup_fresh();
         let owner = Address::generate(&env);
         let spender = Address::generate(&env);
         let recipient = Address::generate(&env);
-
-        client.deposit(&owner, &1000);
+        fund_and_deposit(&env, &sac, &client, &owner, 1000);
         client.approve(&owner, &spender, &500);
-
         let allowance_before = client.allowance(&owner, &spender);
-
         client.transfer_from(&spender, &owner, &recipient, &200);
-
         let allowance_after = client.allowance(&owner, &spender);
-
-        assert_eq!(
-            allowance_before - allowance_after,
-            200,
-            "INVARIANT VIOLATION: Allowance not reduced correctly"
-        );
+        assert_eq!(allowance_before - allowance_after, 200, "INVARIANT VIOLATION: Allowance not reduced correctly");
     }
 
     #[test]
     #[should_panic]
     fn invariant_allowance_cannot_exceed_approval() {
-        let (env, client, _) = setup_fresh();
+        let (env, client, sac, _) = setup_fresh();
         let owner = Address::generate(&env);
         let spender = Address::generate(&env);
         let recipient = Address::generate(&env);
-
-        client.deposit(&owner, &1000);
+        fund_and_deposit(&env, &sac, &client, &owner, 1000);
         client.approve(&owner, &spender, &100);
-
-        // Attempting to spend more than approved should fail
         client.transfer_from(&spender, &owner, &recipient, &150);
     }
 
-    // =========================================================================
-    // INVARIANT 6: No Double Spend
-    // =========================================================================
-    /// A user cannot spend the same tokens twice (either directly or via approval).
+    #[test]
+    fn invariant_decrease_allowance_reduces_correctly() {
+        let (env, client, sac, _) = setup_fresh();
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        fund_and_deposit(&env, &sac, &client, &owner, 1000);
+        client.approve(&owner, &spender, &500);
+        let before = client.allowance(&owner, &spender);
+        client.decrease_allowance(&owner, &spender, &200);
+        let after = client.allowance(&owner, &spender);
+        assert_eq!(before - after, 200, "INVARIANT VIOLATION: decrease_allowance did not reduce allowance by the correct amount");
+    }
+
+    #[test]
+    fn invariant_decrease_allowance_to_zero_resets_cleanly() {
+        let (env, client, sac, _) = setup_fresh();
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        fund_and_deposit(&env, &sac, &client, &owner, 1000);
+        client.approve(&owner, &spender, &300);
+        client.decrease_allowance(&owner, &spender, &300);
+        assert_eq!(client.allowance(&owner, &spender), 0, "INVARIANT VIOLATION: Allowance not zero after full decrease");
+    }
+
+    #[test]
+    fn invariant_decrease_allowance_preserves_supply() {
+        let (env, client, sac, _) = setup_fresh();
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        fund_and_deposit(&env, &sac, &client, &owner, 1000);
+        client.approve(&owner, &spender, &500);
+        let supply_before = client.total_supply();
+        client.decrease_allowance(&owner, &spender, &100);
+        assert_eq!(client.total_supply(), supply_before, "INVARIANT VIOLATION: decrease_allowance changed total supply");
+    }
+
+    #[test]
+    fn invariant_decrease_allowance_does_not_affect_balances() {
+        let (env, client, sac, _) = setup_fresh();
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        fund_and_deposit(&env, &sac, &client, &owner, 1000);
+        client.approve(&owner, &spender, &500);
+        let owner_bal_before = client.balance_of(&owner);
+        let spender_bal_before = client.balance_of(&spender);
+        client.decrease_allowance(&owner, &spender, &100);
+        assert_eq!(client.balance_of(&owner), owner_bal_before, "INVARIANT VIOLATION: decrease_allowance changed owner balance");
+        assert_eq!(client.balance_of(&spender), spender_bal_before, "INVARIANT VIOLATION: decrease_allowance changed spender balance");
+    }
+
+    #[test]
+    fn invariant_increase_allowance_preserves_invariants() {
+        let (env, client, sac, _) = setup_fresh();
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let users = [owner.clone(), spender.clone()];
+        fund_and_deposit(&env, &sac, &client, &owner, 1000);
+        client.approve(&owner, &spender, &500);
+        let supply_before = client.total_supply();
+        let owner_bal_before = client.balance_of(&owner);
+        let spender_bal_before = client.balance_of(&spender);
+        client.increase_allowance(&owner, &spender, &200);
+        assert_eq!(client.total_supply(), supply_before);
+        assert_eq!(client.balance_of(&owner), owner_bal_before);
+        assert_eq!(client.balance_of(&spender), spender_bal_before);
+        verify_supply_conservation(&env, &client, &users);
+    }
+
+    #[test]
+    fn invariant_allowance_decrease_and_transfer_from_sequence() {
+        let (env, client, sac, _) = setup_fresh();
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let users = [owner.clone(), spender.clone(), recipient.clone()];
+        fund_and_deposit(&env, &sac, &client, &owner, 1000);
+        client.approve(&owner, &spender, &500);
+        client.decrease_allowance(&owner, &spender, &200);
+        assert_eq!(client.allowance(&owner, &spender), 300);
+        client.transfer_from(&spender, &owner, &recipient, &300);
+        assert_eq!(client.allowance(&owner, &spender), 0);
+        assert_eq!(client.balance_of(&recipient), 300);
+        verify_supply_conservation(&env, &client, &users);
+    }
+
     #[test]
     #[should_panic]
     fn invariant_no_double_spend_direct() {
-        let (env, client, _) = setup_fresh();
+        let (env, client, sac, _) = setup_fresh();
         let alice = Address::generate(&env);
         let bob = Address::generate(&env);
         let carol = Address::generate(&env);
-
-        client.deposit(&alice, &100);
-
-        // First transfer succeeds
+        fund_and_deposit(&env, &sac, &client, &alice, 100);
         client.transfer(&alice, &bob, &60);
-
-        // Alice now has 40, trying to spend 60 more should fail
         client.transfer(&alice, &carol, &60);
     }
 
-    // =========================================================================
-    // INVARIANT 7: Total Supply Monotonicity
-    // =========================================================================
-    /// Total supply only increases via deposit and only decreases via withdraw/burn.
-    /// Transfers and approvals do not affect total supply.
     #[test]
     fn invariant_supply_only_changes_via_deposit_withdraw_burn() {
-        let (env, client, _) = setup_fresh();
+        let (env, client, sac, _) = setup_fresh();
         let alice = Address::generate(&env);
         let bob = Address::generate(&env);
-
         let initial_supply = client.total_supply();
         assert_eq!(initial_supply, 0);
-
-        // Deposit increases supply
-        client.deposit(&alice, &500);
+        fund_and_deposit(&env, &sac, &client, &alice, 500);
         assert_eq!(client.total_supply(), 500);
         verify_supply_conservation(&env, &client, &[alice.clone(), bob.clone()]);
-
-        // Transfer does not change supply
         client.transfer(&alice, &bob, &200);
-        assert_eq!(
-            client.total_supply(),
-            500,
-            "INVARIANT VIOLATION: Transfer changed total supply"
-        );
+        assert_eq!(client.total_supply(), 500, "INVARIANT VIOLATION: Transfer changed total supply");
         verify_supply_conservation(&env, &client, &[alice.clone(), bob.clone()]);
-
-        // Approve does not change supply
         client.approve(&alice, &bob, &100);
-        assert_eq!(
-            client.total_supply(),
-            500,
-            "INVARIANT VIOLATION: Approve changed total supply"
-        );
+        assert_eq!(client.total_supply(), 500, "INVARIANT VIOLATION: Approve changed total supply");
         verify_supply_conservation(&env, &client, &[alice.clone(), bob.clone()]);
-
-        // Burn decreases supply
         client.burn(&alice, &100);
         assert_eq!(client.total_supply(), 400);
         verify_supply_conservation(&env, &client, &[alice, bob]);
     }
 
-    // =========================================================================
-    // INVARIANT 8: Zero Amount Handling
-    // =========================================================================
-    /// The contract should handle zero amounts appropriately.
     #[test]
     #[should_panic]
     fn invariant_deposit_zero_rejected() {
-        let (env, client, _) = setup_fresh();
+        let (env, client, sac, _) = setup_fresh();
         let user = Address::generate(&env);
-
         client.deposit(&user, &0);
     }
 
     #[test]
     #[should_panic]
     fn invariant_withdraw_zero_rejected() {
-        let (env, client, _) = setup_fresh();
+        let (env, client, sac, _) = setup_fresh();
         let user = Address::generate(&env);
-
-        client.deposit(&user, &100);
+        fund_and_deposit(&env, &sac, &client, &user, 100);
         client.withdraw(&user, &0);
     }
 
     #[test]
     #[should_panic]
     fn invariant_burn_zero_rejected() {
-        let (env, client, _) = setup_fresh();
+        let (env, client, sac, _) = setup_fresh();
         let user = Address::generate(&env);
-
-        client.deposit(&user, &100);
+        fund_and_deposit(&env, &sac, &client, &user, 100);
         client.burn(&user, &0);
     }
 
-    // =========================================================================
-    // INVARIANT 9: Idempotency Properties
-    // =========================================================================
-    /// Certain operations should have predictable idempotent-like behavior.
     #[test]
     fn invariant_approve_overwrites() {
-        let (env, client, _) = setup_fresh();
+        let (env, client, sac, _) = setup_fresh();
         let owner = Address::generate(&env);
         let spender = Address::generate(&env);
-
-        client.deposit(&owner, &1000);
+        fund_and_deposit(&env, &sac, &client, &owner, 1000);
         client.approve(&owner, &spender, &100);
         assert_eq!(client.allowance(&owner, &spender), 100);
-
-        // New approval should overwrite, not add
         client.approve(&owner, &spender, &200);
-        assert_eq!(
-            client.allowance(&owner, &spender),
-            200,
-            "INVARIANT VIOLATION: Approve did not overwrite previous allowance"
-        );
+        assert_eq!(client.allowance(&owner, &spender), 200, "INVARIANT VIOLATION: Approve did not overwrite previous allowance");
     }
-
-    // =========================================================================
-    // PROPERTY-BASED INVARIANT TESTS
-    // =========================================================================
-    /// These tests verify invariants across sequences of operations.
 
     #[test]
     fn property_sequence_invariant() {
-        let (env, client, _) = setup_fresh();
+        let (env, client, sac, _) = setup_fresh();
         let alice = Address::generate(&env);
         let bob = Address::generate(&env);
         let carol = Address::generate(&env);
-
-        // Sequence of operations that should maintain invariants
-        client.deposit(&alice, &1000);
+        fund_and_deposit(&env, &sac, &client, &alice, 1000);
         verify_supply_conservation(&env, &client, &[alice.clone(), bob.clone(), carol.clone()]);
-
-        client.deposit(&bob, &500);
+        fund_and_deposit(&env, &sac, &client, &bob, 500);
         verify_supply_conservation(&env, &client, &[alice.clone(), bob.clone(), carol.clone()]);
-
         client.transfer(&alice, &bob, &200);
         verify_supply_conservation(&env, &client, &[alice.clone(), bob.clone(), carol.clone()]);
-
         client.approve(&bob, &carol, &300);
         verify_supply_conservation(&env, &client, &[alice.clone(), bob.clone(), carol.clone()]);
-
         client.transfer_from(&carol, &bob, &alice, &150);
         verify_supply_conservation(&env, &client, &[alice.clone(), bob.clone(), carol.clone()]);
-
         client.withdraw(&alice, &100);
-        verify_supply_conservation(&env, &client, &[alice, bob, carol]);
+        verify_supply_conservation(&env, &client, &[alice.clone(), bob.clone(), carol.clone()]);
 
         // Verify final invariants
         let total_balance = client.balance_of(&alice) + client.balance_of(&bob) + client.balance_of(&carol);
-
-        assert_eq!(
-            client.total_supply(),
-            total_balance,
-            "PROPERTY VIOLATION: Supply invariant broken after operation sequence"
-        );
-
-        assert!(
-            client.balance_of(&alice) >= 0 && client.balance_of(&bob) >= 0 && client.balance_of(&carol) >= 0,
-            "PROPERTY VIOLATION: Negative balance detected"
-        );
+        assert_eq!(client.total_supply(), total_balance, "PROPERTY VIOLATION: Supply invariant broken after operation sequence");
+        assert!(client.balance_of(&alice) >= 0 && client.balance_of(&bob) >= 0 && client.balance_of(&carol) >= 0, "PROPERTY VIOLATION: Negative balance detected");
     }
 
     #[test]
     fn property_deposit_withdraw_symmetry() {
-        let (env, client, _) = setup_fresh();
+        let (env, client, sac, _) = setup_fresh();
         let user = Address::generate(&env);
-
-        // Deposit then withdraw same amount should return to initial state
         let initial_supply = client.total_supply();
         let initial_balance = client.balance_of(&user);
-
-        client.deposit(&user, &500);
+        fund_and_deposit(&env, &sac, &client, &user, 500);
         verify_supply_conservation(&env, &client, &[user.clone()]);
-
         client.withdraw(&user, &500);
         verify_supply_conservation(&env, &client, &[user.clone()]);
-
-        assert_eq!(
-            client.total_supply(),
-            initial_supply,
-            "PROPERTY VIOLATION: Deposit-withdraw symmetry broken for supply"
-        );
-
-        assert_eq!(
-            client.balance_of(&user),
-            initial_balance,
-            "PROPERTY VIOLATION: Deposit-withdraw symmetry broken for balance"
-        );
+        assert_eq!(client.total_supply(), initial_supply, "PROPERTY VIOLATION: Deposit-withdraw symmetry broken for supply");
+        assert_eq!(client.balance_of(&user), initial_balance, "PROPERTY VIOLATION: Deposit-withdraw symmetry broken for balance");
     }
 
     #[test]
     fn property_transfer_reversibility_check() {
-        let (env, client, _) = setup_fresh();
+        let (env, client, sac, _) = setup_fresh();
         let alice = Address::generate(&env);
         let bob = Address::generate(&env);
-
-        client.deposit(&alice, &1000);
+        fund_and_deposit(&env, &sac, &client, &alice, 1000);
         verify_supply_conservation(&env, &client, &[alice.clone(), bob.clone()]);
-
         let alice_initial = client.balance_of(&alice);
         let bob_initial = client.balance_of(&bob);
-
-        // Transfer A -> B
         client.transfer(&alice, &bob, &300);
         verify_supply_conservation(&env, &client, &[alice.clone(), bob.clone()]);
-
-        // Transfer B -> A (reverse)
         client.transfer(&bob, &alice, &300);
-        verify_supply_conservation(&env, &client, &[alice, bob]);
-
+        verify_supply_conservation(&env, &client, &[alice.clone(), bob.clone()]);
         // After round-trip, balances should be back to original
         assert_eq!(
             client.balance_of(&alice),
@@ -1126,36 +1492,24 @@ mod invariants {
 
     #[test]
     fn property_multi_user_supply_conservation() {
-        let (env, client, _) = setup_fresh();
-        let users: Vec<Address> = (0..10).map(|_| Address::generate(&env)).collect();
-
-        // Random-like deposits
+        let (env, client, sac, _) = setup_fresh();
+        let mut users = std::vec::Vec::new();
         let mut total_deposited = 0_i128;
-        for (i, user) in users.iter().enumerate() {
+        for i in 0..10 {
+            let user = Address::generate(&env);
             let amount = ((i + 1) * 100) as i128;
-            client.deposit(user, &amount);
+            fund_and_deposit(&env, &sac, &client, &user, amount);
             total_deposited += amount;
+            users.push(user);
             verify_supply_conservation(&env, &client, &users);
         }
-
-        assert_eq!(
-            client.total_supply(),
-            total_deposited,
-            "PROPERTY VIOLATION: Total supply doesn't match total deposited"
-        );
-
-        // Random-like transfers between users
+        assert_eq!(client.total_supply(), total_deposited, "PROPERTY VIOLATION: Total supply doesn't match total deposited");
         for i in 0..5 {
-            let from = users.get(i).unwrap();
-            let to = users.get(i + 1).unwrap();
+            let from = &users[i];
+            let to = &users[i + 1];
             client.transfer(from, to, &50);
             verify_supply_conservation(&env, &client, &users);
         }
-
-        assert_eq!(
-            client.total_supply(),
-            total_deposited,
-            "PROPERTY VIOLATION: Supply changed during transfers"
-        );
+        assert_eq!(client.total_supply(), total_deposited, "PROPERTY VIOLATION: Supply changed during transfers");
     }
 }

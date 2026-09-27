@@ -54,13 +54,14 @@ export const createTransaction = async (
   res: Response,
 ): Promise<Response> => {
   try {
-    const { asset_code, amount, sender_info, receiver_info, callback } =
+    const { asset_code, amount, sender_info, receiver_info, callback, quote_id } =
       req.body as {
         asset_code?: string;
         amount?: string;
         sender_info?: Record<string, string>;
         receiver_info?: Record<string, string>;
         callback?: string;
+        quote_id?: string;
       };
 
     if (!asset_code) {
@@ -82,6 +83,8 @@ export const createTransaction = async (
       senderInfo: sender_info,
       receiverInfo: receiver_info,
       callbackUrl: callback,
+      userPublicKey: req.user?.publicKey,
+      quoteId: quote_id,
     });
 
     return res.status(201).json({
@@ -97,7 +100,10 @@ export const createTransaction = async (
         msg === "unsupported asset" ||
         msg.startsWith("amount out of range") ||
         msg.startsWith("Missing sender_info") ||
-        msg.startsWith("Missing receiver_info")
+        msg.startsWith("Missing receiver_info") ||
+        msg.startsWith("quote_not_found") ||
+        msg.startsWith("quote_expired") ||
+        msg.startsWith("quote_already_used")
       ) {
         return res.status(400).json({ error: msg });
       }
@@ -136,7 +142,8 @@ export const getTransaction = async (
       return res.status(404).json({ error: "Transaction not found" });
     }
 
-    return res.status(200).json({
+    // Add additional status tracking information
+    const response = {
       transaction: {
         id: tx.id,
         status: tx.status,
@@ -148,13 +155,18 @@ export const getTransaction = async (
         external_transaction_id: tx.externalTransactionId ?? null,
         started_at: tx.startedAt,
         completed_at: tx.completedAt ?? null,
+        last_status_update: tx.lastStatusUpdate ?? null,
+        status_history: tx.statusHistory ?? [],
         refunded: tx.refunded,
         required_info_message: tx.requiredInfoMessage ?? null,
       },
-    });
+    };
+
+    return res.status(200).json(response);
   } catch (err) {
     logger.error("SEP-31 getTransaction unhandled error", {
       error: err instanceof Error ? err.message : String(err),
+      transactionId: req.params.id,
     });
     return res.status(500).json({ error: "internal server error" });
   }

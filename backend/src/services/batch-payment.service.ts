@@ -11,20 +11,20 @@
 
 import {
   Keypair,
-  Server,
   TransactionBuilder,
   Networks,
   Operation,
   Asset,
-  StrKey,
   Account,
   Horizon,
 } from '@stellar/stellar-sdk';
 import { v4 as uuidv4 } from 'uuid';
 import logger from '../utils/logger';
+import { isValidStellarPublicKey } from '../utils/stellar-address';
 import { SequenceNumberManager } from './sequence-number.service';
 import { getKeyManagementService } from '../lib/key-management.service';
 import { KeyManagementError } from '../lib/key-management.types';
+import { redlock } from '../lib/redis';
 import {
   BatchPaymentRequest,
   BatchPaymentResult,
@@ -44,24 +44,27 @@ const DEFAULT_CONFIG: Partial<BatchPaymentConfig> = {
   retryDelayMs: 1000,
   networkPassphrase: Networks.TESTNET,
   horizonUrl: 'https://horizon-testnet.stellar.org',
+  useDistributedLocking: true,
 };
 
 export class BatchPaymentService {
   private config: BatchPaymentConfig;
-  private server: Server;
+  private server: Horizon.Server;
   private sequenceManager: SequenceNumberManager;
+  private lockClient: typeof redlock;
 
-  constructor(config?: Partial<BatchPaymentConfig>) {
+  constructor(config?: Partial<BatchPaymentConfig>, lockClient?: typeof redlock) {
     this.config = {
       ...DEFAULT_CONFIG,
       ...config,
     } as BatchPaymentConfig;
 
-    this.server = new Server(this.config.horizonUrl);
+    this.server = new Horizon.Server(this.config.horizonUrl);
     this.sequenceManager = new SequenceNumberManager(
       this.config.redisKeyPrefix,
       this.config.lockTimeoutSeconds
     );
+    this.lockClient = lockClient ?? redlock;
   }
 
   /**
@@ -71,8 +74,24 @@ export class BatchPaymentService {
    * The key is held in memory only for the duration of the signing operation.
    */
   async executeBatch(request: BatchPaymentRequest): Promise<BatchPaymentResult> {
-    const batchId = uuidv4();
+    const batchId = request.batchId || uuidv4();
     logger.info(`[Batch ${batchId}] Starting batch payment with ${request.payments.length} operations`);
+
+    const lockKey = `${this.config.redisKeyPrefix}:lock:${batchId}`;
+    let lock: any = null;
+
+    if (this.config.useDistributedLocking && this.lockClient) {
+      try {
+        lock = await this.lockClient.acquire([lockKey], this.config.lockTimeoutSeconds * 1000);
+        logger.info(`[Batch ${batchId}] Acquired distributed lock`);
+      } catch (error: any) {
+        logger.warn(`[Batch ${batchId}] Failed to acquire lock, proceeding without distributed lock. (${error?.message ?? error})`);
+      }
+    } else {
+      logger.debug(`[Batch ${batchId}] Distributed locking disabled or lock client not provided; running without distributed lock`);
+    }
+
+    try {
 
     // Validate batch size
     if (request.payments.length > this.config.maxOperationsPerBatch) {
@@ -191,6 +210,16 @@ export class BatchPaymentService {
       `Batch payment failed after ${this.config.maxRetries} attempts: ${lastError?.message}`,
       { lastError }
     );
+    } finally {
+      if (lock) {
+        try {
+          await lock.release();
+          logger.info(`[Batch ${batchId}] Released distributed lock`);
+        } catch (error) {
+          logger.error(`[Batch ${batchId}] Failed to release lock: ${error}`);
+        }
+      }
+    }
   }
 
   /**
@@ -200,8 +229,9 @@ export class BatchPaymentService {
     payments: PaymentOperation[],
     sourceSecretKey?: string,
     chunkSize: number = 100,
-    encryptedKey?: any,
-    keyId?: string
+    encryptedKey?: BatchPaymentRequest['encryptedKey'],
+    keyId?: string,
+    baseBatchId?: string
   ): Promise<BatchPaymentResult[]> {
     const results: BatchPaymentResult[] = [];
     const chunks = this.chunkArray(payments, chunkSize);
@@ -210,9 +240,11 @@ export class BatchPaymentService {
 
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
+      const perChunkBatchId = `${baseBatchId || uuidv4()}-${i+1}`;
       logger.info(`Processing batch ${i + 1}/${chunks.length} with ${chunk.length} payments`);
 
       const result = await this.executeBatch({
+        batchId: perChunkBatchId,
         payments: chunk,
         sourceSecretKey,
         encryptedKey,
@@ -231,7 +263,7 @@ export class BatchPaymentService {
   async handlePartialFailure(
     failedPayments: PaymentOperation[],
     sourceSecretKey?: string,
-    encryptedKey?: any,
+    encryptedKey?: BatchPaymentRequest['encryptedKey'],
     keyId?: string
   ): Promise<PartialFailureResult> {
     if (failedPayments.length === 0) {
@@ -320,19 +352,20 @@ export class BatchPaymentService {
     
     try {
       const submitResponse = await this.server.submitTransaction(builtTransaction);
+      const feeCharged = this.getSubmittedTransactionFee(submitResponse);
 
       const result: BatchPaymentResult = {
         transactionHash: submitResponse.hash,
         successfulOps: payments.length,
         totalOps: payments.length,
-        feePaid: parseInt(submitResponse.feeCharged, 10),
+        feePaid: feeCharged,
         sequenceNumber: sequenceNumber,
         ledger: submitResponse.ledger,
         timestamp: new Date(),
       };
 
       logger.info(
-        `[Batch ${batchId}] Transaction successful: hash=${submitResponse.hash}, fee=${submitResponse.feeCharged}, ledger=${submitResponse.ledger}`
+        `[Batch ${batchId}] Transaction successful: hash=${submitResponse.hash}, fee=${feeCharged}, ledger=${submitResponse.ledger}`
       );
 
       return result;
@@ -341,7 +374,13 @@ export class BatchPaymentService {
       
       // Check if it's a HorizonApi error with result codes
       if (error && typeof error === 'object' && 'response' in error) {
-        const horizonError = error as Horizon.HorizonApi.ErrorResponse;
+        const horizonError = error as {
+          extras?: {
+            result_codes?: {
+              operations?: string[];
+            };
+          };
+        };
         
         // Handle partial failure scenarios
         if (horizonError.extras?.result_codes) {
@@ -380,10 +419,10 @@ export class BatchPaymentService {
       const payment = payments[i];
 
       // Validate destination address
-      if (!StrKey.isValidEd25519PublicKey(payment.destination)) {
+      if (!isValidStellarPublicKey(payment.destination)) {
         throw new BatchPaymentError(
           BatchErrorType.INVALID_ADDRESS,
-          `Invalid destination address at index ${i}: ${payment.destination}`
+          `Invalid destination Stellar address at index ${i}`
         );
       }
 
@@ -397,7 +436,7 @@ export class BatchPaymentService {
 
       // Validate asset if specified
       if (payment.assetCode && payment.assetCode !== 'XLM') {
-        if (!payment.assetIssuer || !StrKey.isValidEd25519PublicKey(payment.assetIssuer)) {
+        if (!isValidStellarPublicKey(payment.assetIssuer)) {
           throw new BatchPaymentError(
             BatchErrorType.INVALID_ASSET,
             `Invalid asset issuer at index ${i} for asset ${payment.assetCode}`
@@ -405,6 +444,21 @@ export class BatchPaymentService {
         }
       }
     }
+  }
+
+  /**
+   * Extract submitted transaction fees across Stellar SDK response shapes.
+   */
+  private getSubmittedTransactionFee(
+    submitResponse: Horizon.HorizonApi.SubmitTransactionResponse
+  ): number {
+    const responseWithFee = submitResponse as Horizon.HorizonApi.SubmitTransactionResponse & {
+      feeCharged?: number | string;
+      fee_charged?: number | string;
+    };
+    const fee = responseWithFee.fee_charged ?? responseWithFee.feeCharged ?? 0;
+    const parsedFee = Number.parseInt(String(fee), 10);
+    return Number.isFinite(parsedFee) ? parsedFee : 0;
   }
 
   /**
@@ -447,6 +501,7 @@ export class BatchPaymentService {
    * Get batch status (for tracking purposes)
    */
   async getBatchStatus(batchId: string): Promise<BatchStatus | null> {
+    void batchId;
     // This would typically query a database
     // For now, return null as we're not storing batch status
     return null;

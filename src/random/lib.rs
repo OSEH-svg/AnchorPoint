@@ -57,6 +57,7 @@ pub enum DataKey {
 #[contract]
 pub struct RandomNumberGenerator;
 
+#[allow(deprecated)]
 #[contractimpl]
 impl RandomNumberGenerator {
     /// Initialize the random number generator contract
@@ -191,14 +192,15 @@ impl RandomNumberGenerator {
             .get(&DataKey::CommitCount(round_id))
             .unwrap_or(0);
 
-        env.storage()
-            .instance()
-            .set(&DataKey::CommitCount(round_id), &commit_count.checked_add(1).expect("commit count overflow"));
+        env.storage().instance().set(
+            &DataKey::CommitCount(round_id),
+            &commit_count.checked_add(1).expect("commit count overflow"),
+        );
 
         // Topic: event name + round_id (u32 scalar); user Address in data.
         env.events().publish(
             (symbol_short!("commit"), round_id),
-            (user, commitment),
+            (user.clone(), commitment.clone()),
         );
         env.events()
             .publish((symbol_short!("commit"), round_id, user), commitment);
@@ -323,15 +325,14 @@ impl RandomNumberGenerator {
             .get(&DataKey::RevealCount(round_id))
             .unwrap_or(0);
 
-        env.storage()
-            .instance()
-            .set(&DataKey::RevealCount(round_id), &reveal_count.checked_add(1).expect("reveal count overflow"));
+        env.storage().instance().set(
+            &DataKey::RevealCount(round_id),
+            &reveal_count.checked_add(1).expect("reveal count overflow"),
+        );
 
         // Topic: event name + round_id (u32 scalar); user Address in data.
-        env.events().publish(
-            (symbol_short!("reveal"), round_id),
-            user,
-        );
+        env.events()
+            .publish((symbol_short!("reveal"), round_id), user);
     }
 
     /// Compute the final random seed by hashing all revealed secrets

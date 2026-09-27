@@ -8,6 +8,7 @@ export interface TracingContext {
   traceId?: string;
   spanId?: string;
   otelContext?: Context;
+  correlationId?: string;
 }
 
 class TracingManager {

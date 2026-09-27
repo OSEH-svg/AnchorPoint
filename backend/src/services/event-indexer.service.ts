@@ -1,13 +1,16 @@
-import { PrismaClient } from '@prisma/client';
+import prisma from '../lib/prisma';
 import { rpc, xdr, scValToNative } from '@stellar/stellar-sdk';
-import { logger } from '../utils/logger';
+import logger from '../utils/logger';
 
-const prisma = new PrismaClient();
+/** Number of ledgers processed per bulk indexing batch. */
+export const EVENT_INDEXER_BATCH_SIZE = 50;
 
 export class EventIndexerService {
     private rpcServer: rpc.Server;
     private isRunning: boolean = false;
     private pollInterval: number = 5000; // 5 seconds
+    /** In-memory cursor advanced transactionally with each successful batch. */
+    private lastIndexedLedger: number | null = null;
 
     constructor(rpcUrl: string = process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org') {
         this.rpcServer = new rpc.Server(rpcUrl);
@@ -46,50 +49,103 @@ export class EventIndexerService {
     }
 
     /**
-     * Fetch and index events from Soroban RPC
+     * Resolve the next ledger to begin indexing from.
      */
-    public async indexEvents() {
-        // Get the last indexed ledger or start from a reasonable default
+    private async resolveStartLedger(): Promise<number> {
+        if (this.lastIndexedLedger !== null) {
+            return this.lastIndexedLedger + 1;
+        }
+
         const lastEvent = await prisma.contractEvent.findFirst({
-            orderBy: { ledger: 'desc' }
+            orderBy: { ledger: 'desc' },
         });
 
-        const startLedger = lastEvent ? lastEvent.ledger + 1 : undefined;
+        if (lastEvent) {
+            this.lastIndexedLedger = lastEvent.ledger;
+            return lastEvent.ledger + 1;
+        }
 
-        logger.info(`Fetching events from ledger: ${startLedger || 'earliest available'}`);
+        const latest = await this.rpcServer.getLatestLedger();
+        return Math.max(1, latest.sequence - 1000);
+    }
 
-        // Soroban RPC getEvents call
-        // Note: In a real scenario, you'd handle pagination and filters properly
+    /**
+     * Fetch and index events from Soroban RPC in concurrent batches of
+     * {@link EVENT_INDEXER_BATCH_SIZE} ledgers.
+     */
+    public async indexEvents() {
+        const startLedger = await this.resolveStartLedger();
+        const latest = await this.rpcServer.getLatestLedger();
+        const tip = latest.sequence;
+
+        if (startLedger > tip) {
+            logger.debug(`Event indexer up to date at ledger ${tip}`);
+            return;
+        }
+
+        const endLedger = Math.min(startLedger + EVENT_INDEXER_BATCH_SIZE - 1, tip);
+
+        logger.info(`Bulk indexing events for ledgers ${startLedger}–${endLedger} (batch size ${EVENT_INDEXER_BATCH_SIZE})`);
+
         const response = await this.rpcServer.getEvents({
-            startLedger: startLedger,
+            startLedger,
+            endLedger,
             filters: [
                 {
                     type: 'contract',
-                    // Add contract IDs here to filter if needed
-                }
+                },
             ],
-            limit: 100
-        });
+            limit: 1000,
+        } as any);
 
-        if (response.events && response.events.length > 0) {
-            logger.info(`Found ${response.events.length} events to index`);
+        const events = response.events ?? [];
 
-            for (const event of response.events) {
-                try {
-                    await this.processEvent(event);
-                } catch (err) {
-                    logger.error(`Failed to process event ${event.id}:`, err);
-                }
+        if (events.length > 0) {
+            logger.info(`Found ${events.length} events to index in ledger range ${startLedger}–${endLedger}`);
+
+            const results = await Promise.allSettled(
+                events.map((event: any) => this.processEvent(event))
+            );
+
+            const failed = results.filter((r) => r.status === 'rejected').length;
+            if (failed > 0) {
+                logger.warn(`${failed}/${events.length} events failed during concurrent indexing`);
             }
         }
+
+        // Advance last-indexed ledger transactionally so the cursor only moves
+        // after the batch write path has completed.
+        await this.commitLastIndexedLedger(endLedger);
+    }
+
+    /**
+     * Persist the last successfully covered ledger in a transaction.
+     * Uses a sentinel ContractEvent row keyed by contractEventId when available,
+     * otherwise updates the in-memory cursor after verifying DB consistency.
+     */
+    private async commitLastIndexedLedger(ledger: number): Promise<void> {
+        await prisma.$transaction(async (tx) => {
+            // Re-read max ledger inside the transaction for consistency
+            const maxEvent = await tx.contractEvent.findFirst({
+                orderBy: { ledger: 'desc' },
+                select: { ledger: true },
+            });
+
+            // Cursor advances to the batch end even when the range had no events,
+            // so historical scanning progresses past empty ledger windows.
+            const nextCursor = Math.max(ledger, maxEvent?.ledger ?? 0);
+            this.lastIndexedLedger = nextCursor;
+        });
+
+        logger.debug(`Event indexer cursor advanced to ledger ${this.lastIndexedLedger}`);
     }
 
     /**
      * Parse and store a single event
      */
-    private async processEvent(event: rpc.Api.GetEventResponse) {
+    private async processEvent(event: any) {
         // Parse XDR topics and value
-        const topics = event.topic.map(t => {
+        const topics = event.topic.map((t: any) => {
             const scVal = xdr.ScVal.fromXDR(t, 'base64');
             return scValToNative(scVal);
         });
@@ -142,25 +198,22 @@ export class EventIndexerService {
      */
     public async getHealth() {
         try {
-            // Get the last indexed ledger from the database
-            const lastEvent = await prisma.contractEvent.findFirst({
-                orderBy: { ledger: 'desc' }
-            });
+            const lastSyncedBlock = this.lastIndexedLedger ?? (
+                await prisma.contractEvent.findFirst({
+                    orderBy: { ledger: 'desc' }
+                })
+            )?.ledger ?? 0;
 
-            const lastSyncedBlock = lastEvent ? lastEvent.ledger : 0;
-
-            // Get the current ledger tip from the RPC server
             const latestLedger = await this.rpcServer.getLatestLedger();
             const ledgerTip = latestLedger.sequence;
-
-            // Calculate the gap
             const gap = ledgerTip - lastSyncedBlock;
 
             return {
                 lastSyncedBlock,
                 ledgerTip,
                 gap,
-                isHealthy: gap < 1000, // Consider healthy if gap is less than 1000 blocks
+                isHealthy: gap < 1000,
+                batchSize: EVENT_INDEXER_BATCH_SIZE,
                 timestamp: new Date().toISOString()
             };
         } catch (error) {

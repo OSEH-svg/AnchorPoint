@@ -64,7 +64,10 @@ impl IndexingContract {
         env.storage()
             .persistent()
             .set(&DataKey::AddrToId(user), &id);
-        env.storage().instance().set(&DataKey::Counter, &(id.checked_add(1).expect("counter overflow")));
+        env.storage().instance().set(
+            &DataKey::Counter,
+            &(id.checked_add(1).expect("counter overflow")),
+        );
 
         id
     }

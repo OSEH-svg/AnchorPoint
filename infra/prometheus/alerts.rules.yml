@@ -1,0 +1,24 @@
+groups:
+  - name: api-performance-alerts
+    rules:
+      - alert: HighErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) > 0.02
+        for: 2m
+        labels:
+          severity: critical
+          service: anchorpoint-backend
+          team: platform
+        annotations:
+          summary: High 5xx HTTP response error rate detected
+          description: "5xx HTTP response error rate has exceeded 2% over the last 5 minutes (current rate: {{ $value }})."
+
+      - alert: HighP99Latency
+        expr: histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m])) > 1.0
+        for: 2m
+        labels:
+          severity: warning
+          service: anchorpoint-backend
+          team: platform
+        annotations:
+          summary: High P99 API latency detected
+          description: "P99 HTTP request duration latency has exceeded 1 second over the last 5 minutes (current value: {{ $value }}s)."

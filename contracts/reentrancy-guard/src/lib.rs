@@ -37,7 +37,7 @@
 
 #![no_std]
 
-use soroban_sdk::{contracttype, Env, Symbol};
+use soroban_sdk::{contracttype, Env, Symbol, symbol_short};
 
 /// Storage key for the reentrancy guard state
 const REENTRANCY_KEY: Symbol = symbol_short!("REENTRY");
@@ -107,7 +107,7 @@ pub struct ReentrancyGuard<'a> {
     env: &'a Env,
 }
 
-impl<'a> ReentrancyGuard<'a> {
+impl ReentrancyGuard<'_> {
     /// Create a new reentrancy guard
     ///
     /// # Errors
@@ -120,7 +120,7 @@ impl<'a> ReentrancyGuard<'a> {
     /// ```rust,ignore
     /// let _guard = ReentrancyGuard::new(&env)?;
     /// ```
-    pub fn new(env: &'a Env) -> Result<Self, ReentrancyError> {
+    pub fn new(env: &Env) -> Result<Self, ReentrancyError> {
         Self::acquire(env)?;
         Ok(Self { env })
     }
@@ -206,7 +206,7 @@ impl<'a> ReentrancyGuard<'a> {
     }
 }
 
-impl<'a> Drop for ReentrancyGuard<'a> {
+impl Drop for ReentrancyGuard<'_> {
     /// Automatically release the lock when the guard goes out of scope
     fn drop(&mut self) {
         // Ignore errors during drop - we can't panic in drop

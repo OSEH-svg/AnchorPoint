@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { FeeService } from '../../services/fee.service';
+import { toDecimal } from '../../utils/decimal';
 
 /**
  * GET /fees/stats
@@ -39,13 +40,14 @@ export async function estimateFee(req: Request, res: Response, feeService: FeeSe
  */
 export function calculateAssetFee(req: Request, res: Response, feeService: FeeService): void {
   const assetCode = req.query.asset as string;
-  const amountRaw = parseFloat(req.query.amount as string);
+  const amountRaw = req.query.amount as string;
+  const amount = amountRaw ? toDecimal(amountRaw) : null;
 
   if (!assetCode) {
     res.status(400).json({ error: 'asset query parameter is required' });
     return;
   }
-  if (!Number.isFinite(amountRaw) || amountRaw < 0) {
+  if (!amountRaw || !amount || !amount.isFinite() || amount.isNegative()) {
     res.status(400).json({ error: 'amount must be a non-negative number' });
     return;
   }

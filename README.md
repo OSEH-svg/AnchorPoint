@@ -2,6 +2,12 @@
 
 AnchorPoint is a premium, developer-first dashboard template designed for Stellar Anchors. It provides a standardized UI for implementing Stellar Ecosystem Proposals (SEPs), specifically focusing on SEP-24 (Interactive Self-Contained Deposits and Withdrawals).
 
+## Community
+
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Security policy](SECURITY.md) for private vulnerability reports
+- [Bug report](.github/ISSUE_TEMPLATE/bug_report.md) and [feature request](.github/ISSUE_TEMPLATE/feature_request.md) templates
+
 ## Project Structure
 
 This is a monorepo containing:
@@ -89,6 +95,24 @@ docker-compose logs -f
 docker-compose down
 ```
 
+### Testnet Compose Deployment
+
+For testnet deployment readiness, use the dedicated compose file:
+
+```bash
+# Build and run the testnet stack
+docker compose -f docker-compose.testnet.yml up -d --build
+
+# Validate backend health
+curl http://localhost:3002/health
+
+# Check service status
+docker compose -f docker-compose.testnet.yml ps
+
+# Stop testnet stack
+docker compose -f docker-compose.testnet.yml down
+```
+
 ### Services
 
 | Service   | Port | Description                    |
@@ -119,3 +143,156 @@ docker-compose down -v
 ### Development
 
 For local development without Docker, see the [Backend README](./backend/README.md).
+
+## Database Backups
+
+`scripts/backup.sh` takes automated PostgreSQL backups and verifies them before
+they are considered complete.
+
+### Usage
+
+```bash
+DATABASE_URL=postgresql://user:pass@host:5432/anchorpoint \
+  BACKUP_DIR=/var/backups/anchorpoint \
+  BACKUP_RETENTION=14 \
+  scripts/backup.sh
+```
+
+Recommended cron entry (daily at 02:00):
+
+```cron
+0 2 * * * /path/to/AnchorPoint/scripts/backup.sh >> /var/log/anchorpoint-backup.log 2>&1
+```
+
+### What the script does
+
+1. **Dump & compress** — `pg_dump` (plain format, no owner/ACL) piped through gzip.
+2. **SHA-256 checksum** — a `.sha256` sidecar file is written next to every
+   backup (`anchorpoint-<timestamp>.sql.gz.sha256`) so backup integrity can be
+   verified independently:
+
+   ```bash
+   cd /var/backups/anchorpoint
+   sha256sum -c anchorpoint-*.sql.gz.sha256
+   ```
+
+3. **Automated restore check** — when Docker is available (or
+   `BACKUP_VERIFY_RESTORE=1` is set), the script boots a throwaway
+   `postgres:16-alpine` container, restores the fresh backup into it, and
+   removes the container. A backup that cannot be restored is treated as a
+   failure and triggers an alert.
+4. **Failure alerts** — if the dump or restore verification fails, a JSON alert
+   is POSTed to the configured webhook:
+
+   ```bash
+   ALERT_WEBHOOK_URL=https://hooks.slack.com/services/...   # Slack
+   ALERT_WEBHOOK_URL=https://events.pagerduty.com/v2/enqueue/...  # PagerDuty
+   ```
+
+5. **Retention** — backups older than `BACKUP_RETENTION` days are removed.
+
+### Verifying backups manually
+
+```bash
+# Integrity check against the stored checksum
+sha256sum -c /var/backups/anchorpoint/anchorpoint-*.sql.gz.sha256
+
+# Spot-check that the dump is restorable
+gunzip -c /var/backups/anchorpoint/anchorpoint-latest.sql.gz | head -50
+```
+
+### Testing the script
+
+`scripts/backup.test.sh` exercises checksum generation, restore verification,
+and failure-alert wiring with mocked binaries (no database or Docker needed):
+
+```bash
+bash scripts/backup.test.sh
+```
+
+## Testing
+
+### End-to-End Test Suite
+
+The project includes a comprehensive end-to-end test suite that simulates a complete cross-border payment flow, including:
+
+- **SEP-10 Authentication**: Challenge generation and signature verification (mocked for testing)
+- **SEP-12 KYC Submission**: Customer information upload and status tracking
+- **SEP-31 Cross-Border Payments**: Transaction creation, status updates, and settlement
+- **SEP-38 Quotes**: Price discovery and quote generation
+- **SEP-24 Deposits/Withdrawals**: Interactive deposit and withdrawal flows
+
+#### Running E2E Tests
+
+```bash
+# Ensure Docker services are running
+docker-compose up -d
+
+# Run the full E2E test suite
+cd backend
+npm run test:e2e
+
+# Run SEP-31 specific cross-border payment tests
+npm run test:sep31
+```
+
+#### Test Coverage
+
+The E2E test suite covers:
+
+1. **SEP-1 Info**: Stellar.toml configuration and asset discovery
+2. **SEP-10 Auth**: Challenge-response authentication flow (mocked)
+3. **SEP-12 KYC**: Customer information submission and webhook updates
+4. **SEP-31 Payments**: Full cross-border payment lifecycle from creation to settlement
+5. **SEP-38 Quotes**: Firm quote generation with external price feeds
+6. **SEP-24 Interactive**: Deposit/withdrawal flow initiation
+7. **Complete Flow Integration**: End-to-end flow from KYC submission through final settlement
+
+#### Test Flow Example
+
+```typescript
+// 1. SEP-10 Authentication (Mocked for testing)
+const authToken = 'mock-jwt-token-for-e2e-testing';
+
+// 2. SEP-12 KYC Submission
+const kycRes = await request(app)
+  .put('/sep12/customer')
+  .set('Authorization', `Bearer ${authToken}`)
+  .field('account', clientPublicKey)
+  .field('first_name', 'John')
+  .field('last_name', 'Doe');
+
+// 3. SEP-38 Quote Generation
+const quoteRes = await request(app)
+  .post('/sep38/quote')
+  .set('Authorization', `Bearer ${authToken}`)
+  .send({
+    source_asset: 'USDC',
+    source_amount: '100',
+    destination_asset: 'XLM'
+  });
+
+// 4. SEP-31 Transaction Creation
+const transaction = await request(app)
+  .post('/sep31/transactions')
+  .set('Authorization', `Bearer ${authToken}`)
+  .send({
+    asset_code: 'USDC',
+    amount: '100.00',
+    sender_info: { /* KYC data */ },
+    receiver_info: { /* KYC data */ }
+  });
+
+// 5. Status Updates and Settlement
+await request(app)
+  .patch(`/api/admin/transactions/${transaction.id}`)
+  .send({
+    status: 'completed',
+    stellar_transaction_id: 'tx_123',
+    external_transaction_id: 'bank_tx_456',
+    amount_out: '99.50',
+    amount_fee: '0.50'
+  });
+```
+
+The test suite ensures compliance with Stellar Ecosystem Proposals and validates the complete user journey from authentication to final settlement, including proper callback handling and status transitions.
