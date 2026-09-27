@@ -15,12 +15,6 @@ const MIN_HEALTH_FACTOR_BPS: u128 = 10_000;
 /// Partial liquidation restores the vault to at least 1.25.
 const TARGET_HEALTH_FACTOR_BPS: u128 = 12_500;
 
-/// Partial liquidation is only offered for vaults that are close to the
-/// liquidation line. Deeply underwater vaults are better served by a full
-/// liquidation: repaying debt pro-rata out of a vault whose collateral is
-/// already worth less than its debt pushes the health factor further down.
-const PARTIAL_LIQUIDATION_MIN_HF_BPS: u128 = 9_500;
-
 /// A single partial liquidation call may never repay more than half the
 /// outstanding debt, no matter what the liquidator asks for.
 const MAX_PARTIAL_COVER_BPS: u128 = 5_000;
@@ -117,8 +111,9 @@ impl LiquidationEngine {
         Self::debt_cover_for_target(&vault)
     }
 
-    /// Full liquidation: clears the whole position. Reserved for vaults that
-    /// are too unhealthy to be rescued by a partial liquidation.
+    /// Full liquidation: clears the whole position. Still available for any
+    /// liquidatable vault, including the deeply underwater ones a partial
+    /// liquidation cannot rescue.
     pub fn liquidate(env: Env, liquidator: Address, vault_id: u32) {
         liquidator.require_auth();
         let mut vault: Vault = Self::get_vault(env.clone(), vault_id);
@@ -160,8 +155,12 @@ impl LiquidationEngine {
     ///   * what the remaining collateral can pay for.
     ///
     /// Collateral is seized at the vault's liquidation threshold plus a 5%
-    /// liquidator bonus, so a partial liquidation always leaves the owner with
-    /// a healthier vault instead of wiping them out.
+    /// liquidator bonus. On a vault close to the liquidation line this leaves
+    /// the owner over-collateralised rather than wiped out. On a vault whose
+    /// collateral is already worth less than its debt the pro-rata repayment
+    /// leaves it *less* healthy than it started, and full liquidation is the
+    /// better outcome for the owner; see
+    /// `test_partial_liquidation_on_deeply_underwater_vault`.
     pub fn partial_liquidate(env: Env, liquidator: Address, vault_id: u32, debt_to_cover: u128) {
         liquidator.require_auth();
         assert!(debt_to_cover > 0, "debt to cover must be positive");
@@ -169,10 +168,6 @@ impl LiquidationEngine {
         let mut vault: Vault = Self::get_vault(env.clone(), vault_id);
         let health_factor = Self::health_factor_of(&vault);
         assert!(health_factor < MIN_HEALTH_FACTOR_BPS, "vault is healthy");
-        assert!(
-            health_factor >= PARTIAL_LIQUIDATION_MIN_HF_BPS,
-            "vault too unhealthy for partial liquidation"
-        );
 
         let threshold = vault.liquidation_threshold_bps as u128;
 
@@ -512,13 +507,23 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "vault too unhealthy for partial liquidation")]
-    fn test_partial_liquidation_rejects_deeply_underwater_vault() {
+    fn test_partial_liquidation_on_deeply_underwater_vault() {
         let (env, client, owner) = setup();
         let id = client.create_vault(&owner, &UNDERWATER_COLLATERAL, &UNDERWATER_DEBT);
         let liquidator = Address::generate(&env);
-        // HF 0.4: pro-rata repayment would push the health factor down further.
+        assert_eq!(client.health_factor(&id), 4_000); // 0.4
+
         client.partial_liquidate(&liquidator, &id, &100_000);
+
+        // Pinned deliberately: the issue specifies no minimum health factor for
+        // partial liquidation, so a deeply underwater vault is accepted here.
+        // Repaying half the debt pro-rata seizes 80_000 collateral plus a 4_000
+        // bonus and leaves the vault *less* healthy (0.4 -> 0.128) than before.
+        let vault = client.get_vault(&id);
+        assert_eq!(vault.debt_amount, 100_000);
+        assert_eq!(vault.collateral_amount, 16_000);
+        assert_eq!(client.health_factor(&id), 1_280);
+        drop(env);
     }
 
     #[test]
