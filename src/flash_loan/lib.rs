@@ -30,6 +30,8 @@ enum DataKey {
     SecurityRegistry,
     /// Reentrancy lock flag guarding borrower callback execution
     ReentrancyLock,
+    /// Liquidity provider reward pool address
+    RewardPool,
 }
 
 /// Loan details for batch operations
@@ -88,7 +90,11 @@ impl FlashLoanProvider {
 
     /// Get the current fee basis points.
     pub fn get_fee_bps(env: Env) -> u32 {
-        env.storage().instance().get(&DataKey::FeeBps).unwrap_or(5)
+        env.storage().instance().get(&DataKey::FeeBps).unwrap_or(9)
+    }
+
+    pub fn set_reward_pool(env: Env, address: Address) {
+        env.storage().instance().set(&DataKey::RewardPool, &address);
     }
 
     /// Acquire the reentrancy lock, trapping if a flash loan is already in progress.
@@ -141,6 +147,10 @@ impl FlashLoanProvider {
         let balance_after = token_client.balance(&env.current_contract_address());
         if balance_after < required_repayment {
             panic!("Flash loan not repaid with fee");
+        }
+
+        if let Some(reward_pool) = env.storage().instance().get::<_, Address>(&DataKey::RewardPool) {
+            token_client.transfer(&env.current_contract_address(), &reward_pool, &fee);
         }
 
         // 7. Release the lock only after balance verification has completed.
@@ -224,6 +234,9 @@ impl FlashLoanProvider {
                     "Flash loan not repaid for token {:?}: expected {}, got {}",
                     loan.token, expected_repayment, balance_after
                 );
+            }
+            if let Some(reward_pool) = env.storage().instance().get::<_, Address>(&DataKey::RewardPool) {
+                token_client.transfer(&provider_address, &reward_pool, &loan.fee);
             }
         }
 

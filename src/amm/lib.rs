@@ -104,7 +104,7 @@ impl AMM {
             .instance()
             .get(&DataKey::ReserveB)
             .unwrap_or(0);
-        let total_shares: i128 = env
+        let mut total_shares: i128 = env
             .storage()
             .instance()
             .get(&DataKey::TotalShares)
@@ -113,7 +113,13 @@ impl AMM {
         // Calculate shares to mint
         let shares = if total_shares == 0 {
             // Initial liquidity = geometric mean
-            sqrt(amount_a.checked_mul(amount_b).expect("deposit overflow"))
+            let initial_liquidity = sqrt(amount_a.checked_mul(amount_b).expect("deposit overflow"));
+            let minimum_liquidity = 1000;
+            if initial_liquidity <= minimum_liquidity {
+                panic!("insufficient initial liquidity");
+            }
+            total_shares = minimum_liquidity;
+            initial_liquidity.checked_sub(minimum_liquidity).expect("liquidity underflow")
         } else {
             // Proportional liquidity: min(amount_a/reserve_a, amount_b/reserve_b) * total_shares
             let shares_a = amount_a
@@ -788,6 +794,46 @@ mod tests {
         let (client2, _cid2, token_id2) = setup_amm_with_reserves(&env, 1_000_000, 1_000_000);
         let out = client2.swap(&user, &token_id2, &amount_in, &true_out);
         assert_eq!(out, true_out, "exact boundary swap must succeed");
+    }
+
+    #[test]
+    fn test_lp_value_growth_over_100_swaps() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let token_a = env.register(SlippageMockToken, ());
+        let token_b = env.register(SlippageMockToken, ());
+
+        let contract_id = env.register(AMM, ());
+        let client = AMMClient::new(&env, &contract_id);
+
+        client.initialize(&admin, &token_a, &token_b);
+
+        let lp_user = Address::generate(&env);
+        let swapper = Address::generate(&env);
+
+        // Initial deposit to establish shares and reserves
+        client.deposit(&lp_user, &10_000_000, &10_000_000);
+
+        let k_before = 10_000_000_i128 * 10_000_000_i128;
+
+        for i in 0..100 {
+            // Swap alternately A->B and B->A to keep reserves roughly balanced
+            let amount_in = 100_000;
+            let token_in = if i % 2 == 0 { &token_a } else { &token_b };
+            client.swap(&swapper, token_in, &amount_in, &0);
+        }
+
+        let (r_a, r_b) = client.get_reserves();
+        let k_after = r_a * r_b;
+
+        assert!(k_after > k_before, "LP token value (k) should grow due to fee compounding");
+
+        // Verify the value per share increased
+        let initial_total_shares = 10_000_000 - 1000;
+        let final_total_shares = client.get_total_shares();
+        assert_eq!(initial_total_shares, final_total_shares, "Total shares should not change during swaps");
     }
 }
 

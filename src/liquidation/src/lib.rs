@@ -33,6 +33,8 @@ pub enum DataKey {
     CollateralToken,
     DebtToken,
     NextVaultId,
+    GlobalDebtCeiling,
+    TotalDebtIssued,
 }
 
 #[contract]
@@ -58,11 +60,26 @@ impl LiquidationEngine {
             .instance()
             .set(&DataKey::DebtToken, &debt_token);
         env.storage().instance().set(&DataKey::NextVaultId, &1u32);
+        env.storage().instance().set(&DataKey::TotalDebtIssued, &0u128);
+    }
+
+    pub fn set_debt_ceiling(env: Env, ceiling: u128) {
+        env.storage().instance().set(&DataKey::GlobalDebtCeiling, &ceiling);
     }
 
     pub fn create_vault(env: Env, owner: Address, collateral: u128, debt: u128) -> u32 {
         owner.require_auth();
         let id: u32 = env.storage().instance().get(&DataKey::NextVaultId).unwrap();
+
+        let global_ceiling: Option<u128> = env.storage().instance().get(&DataKey::GlobalDebtCeiling);
+        let mut total_debt: u128 = env.storage().instance().get(&DataKey::TotalDebtIssued).unwrap_or(0);
+        
+        if let Some(ceiling) = global_ceiling {
+            assert!(total_debt.checked_add(debt).unwrap() <= ceiling, "global debt ceiling exceeded");
+        }
+        
+        total_debt = total_debt.checked_add(debt).unwrap();
+        env.storage().instance().set(&DataKey::TotalDebtIssued, &total_debt);
 
         let vault = Vault {
             owner: owner.clone(),
@@ -164,6 +181,10 @@ impl LiquidationEngine {
             / 100
             + 10;
 
+        let mut total_debt: u128 = env.storage().instance().get(&DataKey::TotalDebtIssued).unwrap_or(0);
+        total_debt = total_debt.checked_sub(vault.debt_amount).expect("total debt underflow");
+        env.storage().instance().set(&DataKey::TotalDebtIssued, &total_debt);
+
         vault.collateral_amount = 0;
         vault.debt_amount = 0; // Assume debt fully cleared by liquidation
 
@@ -225,6 +246,10 @@ impl LiquidationEngine {
             .debt_amount
             .checked_sub(liquidate_amount)
             .expect("debt underflow");
+
+        let mut total_debt: u128 = env.storage().instance().get(&DataKey::TotalDebtIssued).unwrap_or(0);
+        total_debt = total_debt.checked_sub(liquidate_amount).expect("total debt underflow");
+        env.storage().instance().set(&DataKey::TotalDebtIssued, &total_debt);
 
         env.storage()
             .persistent()
