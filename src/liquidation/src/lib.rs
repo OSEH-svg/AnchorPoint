@@ -19,6 +19,20 @@ const LIQUIDATION_THRESHOLD_BPS: i128 = 12_000;
 /// (1.5000 = 150%). Deliberately less strict than full liquidation.
 const PARTIAL_LIQUIDATION_THRESHOLD_BPS: i128 = 15_000;
 
+/// Health factor a partial liquidation aims to restore (1.2500 = 125%).
+const TARGET_HEALTH_FACTOR_BPS: i128 = 12_500;
+
+/// Largest share of a vault's outstanding debt that a single partial
+/// liquidation call may repay, in basis points (50%).
+const MAX_PARTIAL_COVER_BPS: i128 = 5_000;
+
+/// Liquidator bonus on the collateral seized by a partial liquidation, in
+/// basis points (5%).
+const LIQUIDATOR_BONUS_BPS: i128 = 500;
+
+/// Basis-point denominator.
+const BPS: i128 = 10_000;
+
 #[contracttype]
 pub struct Vault {
     pub owner: Address,
@@ -178,41 +192,69 @@ impl LiquidationEngine {
         );
     }
 
-    pub fn partial_liquidate(env: Env, liquidator: Address, vault_id: u32, liquidate_amount: u128) {
+    /// Debt repayment that lifts the vault to the 1.25 target, so a liquidator
+    /// or front-end can size a call without simulating it. Returns 0 when the
+    /// vault is already at or above the target (or holds no debt), and
+    /// `u128::MAX` when no repayment can reach it.
+    pub fn debt_to_cover_for_target(env: Env, vault_id: u32) -> u128 {
+        let vault: Vault = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Vaults(vault_id))
+            .expect("vault not found");
+
+        Self::target_cover(vault.collateral_amount, vault.debt_amount)
+    }
+
+    /// Partial liquidation: the liquidator asks to cover `debt_to_cover` and the
+    /// engine repays the smallest of
+    ///   * what the liquidator asked for,
+    ///   * the 50% per-call cap on the outstanding debt,
+    ///   * what is actually needed to reach the 1.25 target, and
+    ///   * what the vault still owes, which `debt_to_cover` is already bounded
+    ///     by.
+    ///
+    /// Collateral is seized pro-rata at `collateral_amount / debt_amount` per
+    /// unit of debt covered, plus a 5% liquidator bonus, so a partial
+    /// liquidation cures a near-miss vault instead of wiping it out.
+    pub fn partial_liquidate(env: Env, liquidator: Address, vault_id: u32, debt_to_cover: u128) {
         liquidator.require_auth();
+        assert!(debt_to_cover > 0, "debt to cover must be positive");
+
         let mut vault: Vault = env
             .storage()
             .persistent()
             .get(&DataKey::Vaults(vault_id))
             .expect("vault not found");
 
-        assert!(liquidate_amount > 0, "liquidate amount must be positive");
         assert!(
-            liquidate_amount <= vault.debt_amount,
+            debt_to_cover <= vault.debt_amount,
             "cannot liquidate more than debt"
         );
 
         // Health is evaluated solely through get_health_factor. The zero-debt
-        // case is already excluded by the liquidate_amount <= debt_amount
-        // assertion above combined with liquidate_amount > 0.
+        // case is already excluded by the debt_to_cover <= debt_amount
+        // assertion above combined with debt_to_cover > 0.
         let health_factor = Self::get_health_factor(env.clone(), vault_id);
         assert!(
             health_factor < PARTIAL_LIQUIDATION_THRESHOLD_BPS,
             "vault is healthy for partial liquidation"
         );
 
+        let covered = Self::partial_cover_for(&vault, debt_to_cover);
+        assert!(covered > 0, "nothing to liquidate");
+
         // Collateral seized proportionally to the debt being repaid.
         let collateral_ratio = vault.collateral_amount / vault.debt_amount;
-        let collateral_to_liquidate = liquidate_amount
+        let collateral_to_liquidate = covered
             .checked_mul(collateral_ratio)
             .expect("collateral to liquidate overflow");
 
-        // Liquidator incentive: 3% spread for partial liquidations (lower
-        // incentive than full liquidation).
+        // Liquidator incentive: 5% of the collateral seized.
         let incentive = collateral_to_liquidate
-            .checked_mul(3)
+            .checked_mul(LIQUIDATOR_BONUS_BPS as u128)
             .expect("incentive overflow")
-            / 100;
+            / BPS as u128;
 
         let total_seized = collateral_to_liquidate
             .checked_add(incentive)
@@ -223,7 +265,7 @@ impl LiquidationEngine {
             .expect("insufficient collateral to seize");
         vault.debt_amount = vault
             .debt_amount
-            .checked_sub(liquidate_amount)
+            .checked_sub(covered)
             .expect("debt underflow");
 
         env.storage()
@@ -233,8 +275,76 @@ impl LiquidationEngine {
         // Emit partial liquidation event
         env.events().publish(
             (symbol_short!("p_liquid"), vault_id, liquidator),
-            (liquidate_amount, collateral_to_liquidate, incentive),
+            (covered, collateral_to_liquidate, incentive),
         );
+    }
+
+    /// Debt actually repaid for a `requested` cover, after the 50% per-call cap
+    /// and the 1.25 target clamp. `vault.debt_amount` is non-zero here.
+    fn partial_cover_for(vault: &Vault, requested: u128) -> u128 {
+        // At most half the outstanding debt per call. Never rounded down to
+        // zero, so a dust-sized vault stays liquidatable.
+        let max_cover = (vault.debt_amount * MAX_PARTIAL_COVER_BPS as u128 / BPS as u128).max(1);
+
+        // Never repay more than the vault needs to reach the target. A target of
+        // zero means the vault is already at or above it, so the liquidator's
+        // request stands and only the cap applies.
+        let needed = Self::target_cover(vault.collateral_amount, vault.debt_amount);
+        let target_clamp = if needed == 0 { u128::MAX } else { needed };
+
+        requested.min(max_cover).min(target_clamp)
+    }
+
+    /// Smallest debt repayment that lifts a vault to the 1.25 target, capped at
+    /// the outstanding debt. Returns 0 when the vault is already at or above
+    /// the target, and `u128::MAX` when repaying debt pro-rata can never get
+    /// there.
+    ///
+    /// Solves the same arithmetic `partial_liquidate` performs, so the clamp and
+    /// the state update cannot disagree. With `seize` the health factor given up
+    /// per unit of debt covered, the vault ends at
+    ///   `HF = (collateral - cover * seize) * HF_DECIMALS / (debt - cover)`,
+    /// so requiring `HF >= target` gives
+    ///   `cover >= (target * debt - collateral * HF_DECIMALS) / (target - seize)`.
+    fn target_cover(collateral: u128, debt: u128) -> u128 {
+        if debt == 0 {
+            return 0;
+        }
+
+        // Collateral seized per unit of debt covered, expressed in health factor
+        // bps. Mirrors the pro-rata seizure in `partial_liquidate`, bonus
+        // included, so the two agree to within the bonus truncation.
+        let collateral_ratio = (collateral / debt) as i128;
+        let seize = collateral_ratio
+            .checked_mul(BPS + LIQUIDATOR_BONUS_BPS)
+            .expect("seizure overflow")
+            .checked_mul(HF_DECIMALS)
+            .expect("seizure overflow")
+            / BPS;
+
+        let numerator = TARGET_HEALTH_FACTOR_BPS
+            .checked_mul(debt as i128)
+            .expect("target overflow")
+            .checked_sub(
+                (collateral as i128)
+                    .checked_mul(HF_DECIMALS)
+                    .expect("collateral overflow"),
+            )
+            .expect("target overflow");
+        if numerator <= 0 {
+            // Already at or above the target.
+            return 0;
+        }
+
+        let denominator = TARGET_HEALTH_FACTOR_BPS - seize;
+        if denominator <= 0 {
+            // Seizing collateral costs at least as much health as the repayment
+            // restores, so no cover reaches the target.
+            return u128::MAX;
+        }
+
+        let needed = (numerator as u128).div_ceil(denominator as u128);
+        needed.min(debt)
     }
 }
 
@@ -511,5 +621,130 @@ mod tests {
         // 2 * $1 = $2 collateral, 1 * $1 = $1 debt → HF = 20000 (> 15000) → not eligible
         let vid = client.create_vault(&user, &2u128, &1u128);
         client.partial_liquidate(&liquidator, &vid, &1u128);
+    }
+
+    // ── Partial liquidation: 50% cap, 5% bonus, 1.25 target ───────────────────
+
+    /// Vault balances straight from storage: the contract exposes no public
+    /// getter for them, and the tests need the raw amounts rather than a
+    /// health factor.
+    fn vault_of(env: &Env, client: &LiquidationEngineClient<'static>, vault_id: u32) -> Vault {
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::Vaults(vault_id))
+                .expect("vault not found")
+        })
+    }
+
+    /// A vault one step from the liquidation line: 119_000 collateral against
+    /// 100_000 debt at equal prices → HF = 11_900 (1.1900). Repaying the debt
+    /// needed for 1.25 takes 30_000, which is under the 50% cap, so the target
+    /// is what binds here.
+    const NEAR_MISS_COLLATERAL: u128 = 119_000;
+    const NEAR_MISS_DEBT: u128 = 100_000;
+
+    #[test]
+    fn test_debt_to_cover_for_target_scales_with_the_shortfall() {
+        let (_env, client, _oracle_id, _ct, _dt) = setup();
+        let user = Address::generate(&_env);
+
+        // Already past the 1.25 target: nothing to cover.
+        let healthy = client.create_vault(&user, &130_000u128, &100_000u128);
+        assert_eq!(client.get_health_factor(&healthy), 13_000);
+        assert_eq!(client.debt_to_cover_for_target(&healthy), 0);
+
+        // Underwater: (12_500 * 100_000 - 119_000 * 10_000) / 2_000 = 30_000.
+        let near_miss = client.create_vault(&user, &NEAR_MISS_COLLATERAL, &NEAR_MISS_DEBT);
+        assert_eq!(client.debt_to_cover_for_target(&near_miss), 30_000);
+    }
+
+    #[test]
+    fn test_partial_liquidation_restores_target_health_factor() {
+        let (_env, client, _oracle_id, _ct, _dt) = setup();
+        let user = Address::generate(&_env);
+        let liquidator = Address::generate(&_env);
+
+        let vid = client.create_vault(&user, &NEAR_MISS_COLLATERAL, &NEAR_MISS_DEBT);
+        assert_eq!(client.get_health_factor(&vid), 11_900);
+
+        // Asking for the whole 50% cap would overshoot the target, so the engine
+        // trims the repayment to what the vault actually needs.
+        client.partial_liquidate(&liquidator, &vid, &50_000u128);
+
+        let vault = vault_of(&_env, &client, vid);
+        assert_eq!(vault.debt_amount, 70_000);
+        assert_eq!(vault.collateral_amount, 87_500);
+        assert_eq!(client.get_health_factor(&vid), TARGET_HEALTH_FACTOR_BPS);
+        assert!(!client.is_liquidatable(&vid));
+    }
+
+    #[test]
+    fn test_partial_liquidation_caps_cover_at_half_the_debt() {
+        let (_env, client, _oracle_id, _ct, _dt) = setup();
+        let user = Address::generate(&_env);
+        let liquidator = Address::generate(&_env);
+
+        // 114_000 / 100_000 → HF = 11_400. Reaching 1.25 would need 55_000,
+        // more than the 50% cap allows, so the cap binds instead.
+        let vid = client.create_vault(&user, &114_000u128, &100_000u128);
+        assert!(client.debt_to_cover_for_target(&vid) > 50_000);
+
+        // Asking for the entire debt still only repays half of it.
+        client.partial_liquidate(&liquidator, &vid, &100_000u128);
+
+        let vault = vault_of(&_env, &client, vid);
+        assert_eq!(vault.debt_amount, 50_000);
+        // Left safe, though still short of the 1.25 target: a later call can
+        // finish the job.
+        assert_eq!(client.get_health_factor(&vid), 12_300);
+        assert!(!client.is_liquidatable(&vid));
+    }
+
+    #[test]
+    fn test_partial_liquidation_pays_five_percent_bonus() {
+        let (_env, client, _oracle_id, _ct, _dt) = setup();
+        let user = Address::generate(&_env);
+        let liquidator = Address::generate(&_env);
+
+        let vid = client.create_vault(&user, &NEAR_MISS_COLLATERAL, &NEAR_MISS_DEBT);
+        client.partial_liquidate(&liquidator, &vid, &30_000u128);
+
+        // Pro-rata seizure at a 1:1 ratio is 30_000, plus a 5% bonus of 1_500.
+        let vault = vault_of(&_env, &client, vid);
+        assert_eq!(
+            vault.collateral_amount,
+            NEAR_MISS_COLLATERAL - 30_000 - 1_500
+        );
+        assert_eq!(vault.debt_amount, NEAR_MISS_DEBT - 30_000);
+    }
+
+    #[test]
+    fn test_partial_liquidation_preserves_owner_collateral_vs_full() {
+        let (_env, client, _oracle_id, _ct, _dt) = setup();
+        let user = Address::generate(&_env);
+        let liquidator = Address::generate(&_env);
+
+        // The same starting position on both paths.
+        let partial_id = client.create_vault(&user, &NEAR_MISS_COLLATERAL, &NEAR_MISS_DEBT);
+        let full_id = client.create_vault(&user, &NEAR_MISS_COLLATERAL, &NEAR_MISS_DEBT);
+
+        client.partial_liquidate(&liquidator, &partial_id, &50_000u128);
+        client.liquidate(&liquidator, &full_id);
+
+        let partial = vault_of(&_env, &client, partial_id);
+        let full = vault_of(&_env, &client, full_id);
+
+        // Partial: the owner keeps collateral and a now over-collateralised debt
+        // position at the 1.25 target.
+        assert_eq!(partial.collateral_amount, 87_500);
+        assert_eq!(partial.debt_amount, 70_000);
+        assert!(!client.is_liquidatable(&partial_id));
+
+        // Full: the owner keeps nothing.
+        assert_eq!(full.collateral_amount, 0);
+        assert_eq!(full.debt_amount, 0);
+
+        assert!(partial.collateral_amount > full.collateral_amount);
     }
 }
